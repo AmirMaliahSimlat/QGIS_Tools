@@ -1,0 +1,19 @@
+# Large GIS source data and generated outputs (not for GitHub)
+Nablus Data Layers/
+Building Altitude Outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.qgz
+*.qgs~
