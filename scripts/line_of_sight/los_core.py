@@ -15,9 +15,11 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-_SCRIPTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _SCRIPTS_ROOT not in sys.path:
-    sys.path.insert(0, _SCRIPTS_ROOT)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS_ROOT = os.path.dirname(_THIS_DIR)
+for _p in (_THIS_DIR, _SCRIPTS_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from quantized_mesh import QuantizedMeshSampler
 
