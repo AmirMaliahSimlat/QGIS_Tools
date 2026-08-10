@@ -163,7 +163,7 @@ class LineOfSightCheckerAlgorithm(QgsProcessingAlgorithm):
                 self.tr(
                     "Consider buildings is on, but no buildings layer was provided. "
                     "Use the buildings shapefile with an 'altitude' attribute "
-                    "(output of Building min quantized-mesh altitude)."
+                    "(output of Building altitude and random height)."
                 )
             )
         fields = source.fields()
