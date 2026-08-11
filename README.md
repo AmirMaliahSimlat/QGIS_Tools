@@ -7,6 +7,7 @@ scripts/
   quantized_mesh.py      # shared Cesium quantized-mesh reader
   building_altitude/     # Building altitude + random height
   line_of_sight/         # Line-of-Sight checker
+  tree_points/           # Tree-mask polygons → spaced points
 ```
 
 When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) available (same `scripts/` parent, or copy it next to the algorithm if QGIS isolates scripts).
@@ -65,3 +66,24 @@ Folder: [`scripts/line_of_sight/`](scripts/line_of_sight/)
 **Output:** `true` if no hit, `false` if any hit.
 
 Optional **Consider buildings** uses the altitude layer (`altitude` + `RELATIVE_F` extrusions). **Distance between sample points on the line** is an input (default **1 m**).
+
+## Tree mask polygons to spaced points
+
+Folder: [`scripts/tree_points/`](scripts/tree_points/)
+
+| File | Role |
+| --- | --- |
+| [`tree_mask_to_points.py`](scripts/tree_points/tree_mask_to_points.py) | QGIS Processing algorithm |
+| Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh reader |
+
+Converts tree-mask polygons into **PointZ** features with hardcoded `altitude` from the quantized mesh.
+
+Points are placed on a **hexagonal lattice** so nearest neighbors are exactly the chosen spacing; no two points are closer than **Minimum distance between points (meters)** (default **1.5**). Small mask polygons that miss the lattice get a centroid (or point-on-surface) if spacing still allows.
+
+Distances are computed in an auto-selected UTM zone from the layer extent.
+
+### Install / run in QGIS
+
+1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
+2. Select `scripts/tree_points/tree_mask_to_points.py` (keep `quantized_mesh.py` available)
+3. Run **QGIS Projects → Tree mask polygons to spaced points**
