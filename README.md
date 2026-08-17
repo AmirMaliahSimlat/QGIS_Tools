@@ -8,6 +8,7 @@ scripts/
   building_altitude/     # Building altitude + random height
   line_of_sight/         # Line-of-Sight checker
   tree_points/           # Tree-mask polygons → spaced points
+  roof_type/             # Assign roof_type from zone polygons
 ```
 
 When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) available (same `scripts/` parent, or copy it next to the algorithm if QGIS isolates scripts).
@@ -87,3 +88,56 @@ Distances are computed in an auto-selected UTM zone from the layer extent.
 1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
 2. Select `scripts/tree_points/tree_mask_to_points.py` (keep `quantized_mesh.py` available)
 3. Run **QGIS Projects → Tree mask polygons to spaced points**
+
+## Thin tree points
+
+Folder: [`scripts/tree_points/`](scripts/tree_points/)
+
+| File | Role |
+| --- | --- |
+| [`thin_tree_points.py`](scripts/tree_points/thin_tree_points.py) | QGIS Processing algorithm |
+| [`thin_tree_points_cli.py`](scripts/tree_points/thin_tree_points_cli.py) | CLI (OSGeo4W / GDAL) |
+| [`thin_core.py`](scripts/tree_points/thin_core.py) | Uniform random sample |
+
+Keeps a **uniform random subset** of points (no polygons). Default target for Fort Riley is **1,000,000** points from ~2.5M. Writes a **new** shapefile; the input is not overwritten.
+
+Copy `thin_tree_points.py` into the QGIS scripts folder (CLI also needs `thin_core.py` next to it).
+
+### CLI (Fort Riley ~2.5M → 1M)
+
+```bat
+call "C:\Program Files\QGIS 3.44.12\OSGeo4W.bat"
+cd /d "C:\Dev\QGIS Projects"
+python -u "scripts\tree_points\thin_tree_points_cli.py" ^
+  --points "Fort Riley Data Layers\Trees\tree_points.shp" ^
+  --output "Fort Riley Data Layers\Trees\tree_points_1M.shp" ^
+  --keep-count 1000000 ^
+  --seed 42
+```
+
+## Assign roof type from zones
+
+Folder: [`scripts/roof_type/`](scripts/roof_type/)
+
+| File | Role |
+| --- | --- |
+| [`assign_roof_type.py`](scripts/roof_type/assign_roof_type.py) | QGIS Processing algorithm |
+| [`roof_type_core.py`](scripts/roof_type/roof_type_core.py) | Overlap → type rules |
+
+Copies buildings and adds integer **`roof_type`** from a zones polygon layer (same field name).
+
+| Building vs zones | Result |
+| --- | --- |
+| No overlap | NULL |
+| Partial overlap | counts as inside |
+| Completely inside one type, only partial in another | the complete type |
+| Completely inside two different types, or only partial in two different types | random among those types |
+
+Copy **both** `assign_roof_type.py` and `roof_type_core.py` into the QGIS scripts folder.
+
+### Install / run in QGIS
+
+1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
+2. Select `scripts/roof_type/assign_roof_type.py`
+3. Run **QGIS Projects → Assign roof type from zones**
+
