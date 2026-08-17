@@ -7,7 +7,7 @@ scripts/
   quantized_mesh.py      # shared Cesium quantized-mesh reader
   building_altitude/     # Building altitude + random height
   line_of_sight/         # Line-of-Sight checker
-  tree_points/           # Tree-mask polygons → spaced points
+  tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
 ```
 
@@ -74,7 +74,10 @@ Folder: [`scripts/tree_points/`](scripts/tree_points/)
 
 | File | Role |
 | --- | --- |
-| [`tree_mask_to_points.py`](scripts/tree_points/tree_mask_to_points.py) | QGIS Processing algorithm |
+| [`tree_mask_to_points.py`](scripts/tree_points/tree_mask_to_points.py) | QGIS: polygons → spaced points |
+| [`sample_tree_rgb.py`](scripts/tree_points/sample_tree_rgb.py) | QGIS: sample GeoTIFF RGB → R/G/B |
+| [`sample_tree_rgb_cli.py`](scripts/tree_points/sample_tree_rgb_cli.py) | CLI for RGB sampling |
+| [`rgb_core.py`](scripts/tree_points/rgb_core.py) | 0–255 conversion |
 | Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh reader |
 
 Converts tree-mask polygons into **PointZ** features with hardcoded `altitude` from the quantized mesh.
@@ -88,6 +91,29 @@ Distances are computed in an auto-selected UTM zone from the layer extent.
 1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
 2. Select `scripts/tree_points/tree_mask_to_points.py` (keep `quantized_mesh.py` available)
 3. Run **QGIS Projects → Tree mask polygons to spaced points**
+
+## Sample tree RGB from GeoTIFF
+
+Adds integer fields **`R`**, **`G`**, **`B`** (0–255) from bands 1/2/3 of georeferenced TIFFs at each tree point. **Input is an imagery folder**: the tool recursively finds every `.tif`/`.tiff` in that folder and all subfolders (other files are ignored). Each point is sampled from the tile that covers it. Points off all images get NULL.
+
+Copy `sample_tree_rgb.py` **and** `rgb_core.py` into the QGIS scripts folder.
+
+### Install / run in QGIS
+
+1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
+2. Select `scripts/tree_points/sample_tree_rgb.py`
+3. Run **QGIS Projects → Sample tree RGB from GeoTIFF**
+
+### CLI
+
+```bat
+call "C:\Program Files\QGIS 3.44.12\OSGeo4W.bat"
+cd /d "C:\Dev\QGIS Projects"
+python -u "scripts\tree_points\sample_tree_rgb_cli.py" ^
+  --points "Fort Riley Data Layers\Trees\tree_points_1M.shp" ^
+  --raster "path\to\imagery_folder" ^
+  --output "Fort Riley Data Layers\Trees\tree_points_1M_rgb.shp"
+```
 
 ## Thin tree points
 
