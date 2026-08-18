@@ -84,6 +84,8 @@ Converts tree-mask polygons into **PointZ** features with hardcoded `altitude` f
 
 Points are placed on a **hexagonal lattice** so nearest neighbors are exactly the chosen spacing; no two points are closer than **Minimum distance between points (meters)** (default **1.5**). Small mask polygons that miss the lattice get a centroid (or point-on-surface) if spacing still allows.
 
+A **buildings** polygon layer is required. Trees are not placed inside footprints, and a **Clearance from buildings** (default **1 m**) keeps them off the walls.
+
 Distances are computed in an auto-selected UTM zone from the layer extent.
 
 ### Install / run in QGIS

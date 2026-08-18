@@ -31,6 +31,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
     QgsProject,
+    QgsSpatialIndex,
     QgsWkbTypes,
 )
 
@@ -47,8 +48,10 @@ ALTITUDE_FIELD = "altitude"
 
 class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_POLYGONS = "INPUT_POLYGONS"
+    INPUT_BUILDINGS = "INPUT_BUILDINGS"
     INPUT_MESH = "INPUT_MESH"
     MIN_DISTANCE = "MIN_DISTANCE"
+    BUILDING_CLEARANCE = "BUILDING_CLEARANCE"
     OUTPUT = "OUTPUT"
 
     def tr(self, string):
@@ -77,6 +80,9 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             "so no two accepted points are closer than the chosen distance. "
             "Polygons that receive no lattice point get their centroid if it "
             "still respects the spacing.\n\n"
+            "A buildings polygon layer is required: no tree is placed inside "
+            "a footprint or within the building-clearance distance (default "
+            "1 m).\n\n"
             f"Each output point is PointZ with attribute '{ALTITUDE_FIELD}' "
             "sampled from the quantized-mesh tileset at that location."
         )
@@ -86,6 +92,13 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterVectorLayer(
                 self.INPUT_POLYGONS,
                 self.tr("Tree mask polygons"),
+                [QgsProcessing.TypeVectorPolygon],
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterVectorLayer(
+                self.INPUT_BUILDINGS,
+                self.tr("Buildings footprints"),
                 [QgsProcessing.TypeVectorPolygon],
             )
         )
@@ -106,6 +119,15 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            QgsProcessingParameterNumber(
+                self.BUILDING_CLEARANCE,
+                self.tr("Clearance from buildings (meters)"),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=1.0,
+                minValue=0.0,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
                 self.tr("Spaced tree points"),
@@ -116,13 +138,21 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         layer = self.parameterAsVectorLayer(
             parameters, self.INPUT_POLYGONS, context
         )
+        buildings = self.parameterAsVectorLayer(
+            parameters, self.INPUT_BUILDINGS, context
+        )
         mesh_folder = self.parameterAsFile(parameters, self.INPUT_MESH, context)
         min_dist = self.parameterAsDouble(
             parameters, self.MIN_DISTANCE, context
         )
+        clearance = self.parameterAsDouble(
+            parameters, self.BUILDING_CLEARANCE, context
+        )
 
         if layer is None:
             raise QgsProcessingException(self.tr("Invalid polygon layer."))
+        if buildings is None:
+            raise QgsProcessingException(self.tr("Invalid buildings layer."))
         if not mesh_folder or not os.path.isdir(mesh_folder):
             raise QgsProcessingException(
                 self.tr("Invalid quantized-mesh tiles folder.")
@@ -130,6 +160,10 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         if min_dist <= 0:
             raise QgsProcessingException(
                 self.tr("Minimum distance must be > 0.")
+            )
+        if clearance < 0:
+            raise QgsProcessingException(
+                self.tr("Building clearance must be ≥ 0.")
             )
 
         feedback.setProgressText(self.tr("Opening quantized-mesh…"))
@@ -192,6 +226,16 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        feedback.setProgressText(self.tr("Indexing buildings…"))
+        bldg_index, bldg_geoms, n_bldg = self._index_buildings(
+            buildings, metric_crs, clearance, feedback
+        )
+        feedback.pushInfo(
+            self.tr(
+                f"Excluding {n_bldg} buildings with {clearance} m clearance."
+            )
+        )
+
         # Pack in a true meter CRS. Prefer the layer CRS when it is already
         # projected metres; otherwise use the local UTM zone.
         dx = min_dist
@@ -234,6 +278,10 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                     if not geom.intersects(probe):
                         continue
                     xy = (pt.x(), pt.y())
+                    if self._blocked_by_building(
+                        xy, bldg_index, bldg_geoms
+                    ):
+                        continue
                     if not self._far_enough_grid(xy, grid, cell, min_dist_sq):
                         continue
                     accepted_metric.append(xy)
@@ -272,6 +320,8 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                 except Exception:
                     continue
             if not self._far_enough_grid(cxy, grid, cell, min_dist_sq):
+                continue
+            if self._blocked_by_building(cxy, bldg_index, bldg_geoms):
                 continue
             accepted_metric.append(cxy)
             self._grid_insert(grid, cell, cxy)
@@ -414,6 +464,50 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             f"(layer CRS was {crs.authid() or 'unknown'})."
         )
         return metric
+
+    @staticmethod
+    def _index_buildings(buildings, metric_crs, clearance, feedback):
+        """Buffered building polygons in metric CRS + spatial index."""
+        to_metric = QgsCoordinateTransform(
+            buildings.sourceCrs(), metric_crs, QgsProject.instance()
+        )
+        index = QgsSpatialIndex()
+        geoms = {}
+        n = 0
+        for feat in buildings.getFeatures():
+            if feedback.isCanceled():
+                break
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            metric_geom = QgsGeometry(geom)
+            if metric_geom.transform(to_metric) != 0:
+                continue
+            metric_geom = metric_geom.makeValid()
+            if metric_geom.isEmpty():
+                continue
+            if clearance > 0:
+                buffered = metric_geom.buffer(clearance, 8)
+                if buffered is None or buffered.isEmpty():
+                    buffered = metric_geom
+                metric_geom = buffered
+            stored = QgsFeature(n)
+            stored.setGeometry(metric_geom)
+            geoms[n] = stored.geometry()
+            index.addFeature(stored)
+            n += 1
+        return index, geoms, n
+
+    @staticmethod
+    def _blocked_by_building(xy, index, geoms):
+        if not geoms:
+            return False
+        probe = QgsGeometry.fromPointXY(QgsPointXY(xy[0], xy[1]))
+        for fid in index.intersects(probe.boundingBox()):
+            g = geoms.get(fid)
+            if g is not None and g.intersects(probe):
+                return True
+        return False
 
     @staticmethod
     def _hex_points_local(bbox, dx, dy, phase_x=0.0, phase_y=0.0):
