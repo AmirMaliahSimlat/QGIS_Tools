@@ -75,6 +75,7 @@ Folder: [`scripts/tree_points/`](scripts/tree_points/)
 | File | Role |
 | --- | --- |
 | [`tree_mask_to_points.py`](scripts/tree_points/tree_mask_to_points.py) | QGIS: polygons → spaced points |
+| [`filter_trees_on_buildings.py`](scripts/tree_points/filter_trees_on_buildings.py) | QGIS: drop existing points on/near buildings |
 | [`sample_tree_rgb.py`](scripts/tree_points/sample_tree_rgb.py) | QGIS: sample GeoTIFF RGB → R/G/B |
 | [`sample_tree_rgb_cli.py`](scripts/tree_points/sample_tree_rgb_cli.py) | CLI for RGB sampling |
 | [`rgb_core.py`](scripts/tree_points/rgb_core.py) | 0–255 conversion |
@@ -93,6 +94,16 @@ Distances are computed in an auto-selected UTM zone from the layer extent.
 1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
 2. Select `scripts/tree_points/tree_mask_to_points.py` (keep `quantized_mesh.py` available)
 3. Run **QGIS Projects → Tree mask polygons to spaced points**
+
+## Remove tree points on buildings
+
+Post-process an **existing** tree-point layer: drop points inside building footprints or within **Clearance from buildings** (default **1 m**). Does not re-pack from polygons. Copy `filter_trees_on_buildings.py` into the QGIS scripts folder.
+
+### Install / run in QGIS
+
+1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
+2. Select `scripts/tree_points/filter_trees_on_buildings.py`
+3. Run **QGIS Projects → Remove tree points on buildings**
 
 ## Sample tree RGB from GeoTIFF
 
