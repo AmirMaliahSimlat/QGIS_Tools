@@ -407,7 +407,13 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         feedback,
         progress_cb,
     ):
-        """Sparse axis-aligned grid of points inside the polygon."""
+        """
+        Sparse axis-aligned grid inside the polygon.
+
+        Uses horizontal scanlines clipped to the polygon so thin road masks
+        do not pay for every empty cell in a huge bounding box (the old
+        contains()-per-cell approach).
+        """
         if grid_spacing <= 0:
             return []
 
@@ -420,16 +426,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         xmax = bbox.xMaximum()
         ymax = bbox.yMaximum()
 
-        # Snap grid origin to spacing so neighboring polygons share phase.
-        x0 = math.floor(xmin / grid_spacing) * grid_spacing
         y0 = math.floor(ymin / grid_spacing) * grid_spacing
-
-        xs = []
-        x = x0
-        while x <= xmax + 1e-9:
-            if x >= xmin - 1e-9:
-                xs.append(x)
-            x += grid_spacing
         ys = []
         y = y0
         while y <= ymax + 1e-9:
@@ -437,35 +434,70 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 ys.append(y)
             y += grid_spacing
 
-        total = max(len(xs) * len(ys), 1)
+        n_rows = max(len(ys), 1)
         out = []
-        checked = 0
         for yi, cy in enumerate(ys):
             if feedback.isCanceled():
                 break
-            for cx in xs:
-                checked += 1
-                pt = QgsGeometry.fromPointXY(QgsPointXY(cx, cy))
-                if not metric_poly.contains(pt):
-                    if checked % 250 == 0 or checked == total:
-                        progress_cb(checked, total, "grid")
-                    continue
-                alt_f, z, ok = self._sample_metric_xy(
-                    cx, cy, to_source, to_wgs84, sampler
-                )
-                if not ok:
-                    if checked % 250 == 0 or checked == total:
-                        progress_cb(checked, total, "grid")
-                    continue
-                out.append((cx, cy, alt_f, z))
-                if checked % 100 == 0 or checked == total:
-                    progress_cb(checked, total, "grid")
-            # Always tick once per row on long polygons.
-            if yi % 5 == 0 or yi + 1 == len(ys):
-                progress_cb(checked, total, "grid")
 
-        progress_cb(total, total, "grid")
+            # Clip a horizontal line at this grid Y to the polygon interior.
+            hline = QgsGeometry.fromPolylineXY(
+                [
+                    QgsPointXY(xmin - grid_spacing, cy),
+                    QgsPointXY(xmax + grid_spacing, cy),
+                ]
+            )
+            clipped = hline.intersection(metric_poly)
+            if clipped is not None and not clipped.isEmpty():
+                for pts in self._iter_polyline_parts(clipped):
+                    if len(pts) < 2:
+                        continue
+                    # Walk each subsegment; place snapped X on the global grid.
+                    for a, b in zip(pts, pts[1:]):
+                        x1, x2 = a.x(), b.x()
+                        if x2 < x1:
+                            x1, x2 = x2, x1
+                        if x2 - x1 < 1e-9:
+                            continue
+                        cx = math.ceil(x1 / grid_spacing) * grid_spacing
+                        if cx < x1 - 1e-9:
+                            cx += grid_spacing
+                        while cx <= x2 + 1e-9:
+                            alt_f, z, ok = self._sample_metric_xy(
+                                cx, cy, to_source, to_wgs84, sampler
+                            )
+                            if ok:
+                                out.append((cx, cy, alt_f, z))
+                            cx += grid_spacing
+
+            if yi % 25 == 0 or yi + 1 == n_rows:
+                progress_cb(yi + 1, n_rows, "grid")
+
+        progress_cb(n_rows, n_rows, "grid")
         return out
+
+    @staticmethod
+    def _iter_polyline_parts(geom):
+        """Yield lists of QgsPointXY for each line component."""
+        if geom is None or geom.isEmpty():
+            return
+        wkb = QgsWkbTypes.flatType(geom.wkbType())
+        if wkb == QgsWkbTypes.LineString:
+            pts = geom.asPolyline()
+            if pts:
+                yield pts
+            return
+        if wkb == QgsWkbTypes.MultiLineString:
+            for part in geom.asMultiPolyline():
+                if part:
+                    yield part
+            return
+        for part in geom.asGeometryCollection() or []:
+            if part is None or part.isEmpty():
+                continue
+            yield from PolygonMaskPointsAlgorithm._iter_polyline_parts(
+                QgsGeometry(part)
+            )
 
     def _sample_center_points_legacy_chords(
         self,
