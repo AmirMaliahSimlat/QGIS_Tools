@@ -3,8 +3,12 @@
 QGIS Processing algorithm: sample polygon-mask points with altitude.
 
 Always densifies outlines (exterior rings and holes). Optionally adds
-dense centerline points (chord midpoints across the mask) with mesh
-altitude; Unreal can ignore centers below the local road plane.
+interior center points with mesh altitude (Unreal can ignore centers
+below the local road plane).
+
+Center modes:
+  - Sparse grid (default): axis-aligned grid inside each polygon part
+  - Legacy chord midpoints: inward perpendicular chords from the outline
 """
 
 import math
@@ -26,6 +30,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFile,
     QgsProcessingParameterNumber,
@@ -48,12 +53,17 @@ ROLE_FIELD = "point_role"
 ROLE_OUTLINE = "outline"
 ROLE_CENTER = "center"
 
+CENTER_MODE_GRID = 0
+CENTER_MODE_LEGACY_CHORDS = 1
+
 
 class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_POLYGONS = "INPUT_POLYGONS"
     INPUT_MESH = "INPUT_MESH"
     SPACING = "SPACING"
     ADD_CENTER_POINTS = "ADD_CENTER_POINTS"
+    CENTER_MODE = "CENTER_MODE"
+    CENTER_GRID_SPACING = "CENTER_GRID_SPACING"
     OUTPUT = "OUTPUT"
 
     def tr(self, string):
@@ -81,12 +91,11 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             "terrain altitude from a Cesium quantized-mesh tileset.\n\n"
             f"Output is PointZ with '{ALTITUDE_FIELD}' and '{ROLE_FIELD}' "
             f"('{ROLE_OUTLINE}' or '{ROLE_CENTER}').\n\n"
-            "Optional toggle: Add centerline points. Densely samples chord "
-            "midpoints across each exterior ring (inward perpendiculars) "
-            "and writes mesh altitude there. Includes centers even where "
-            "terrain is below the road plane — the Unreal road plugin can "
-            "ignore those. When the toggle is off, only outline points "
-            "are written.\n\n"
+            "Optional: Add center points inside each mask. Default mode is "
+            "a sparse axis-aligned grid (set grid spacing separately). "
+            "Legacy mode keeps the older chord-midpoint centerline walk. "
+            "Centers are written even where terrain is below the road "
+            "plane — the Unreal road plugin can ignore those.\n\n"
             "Expects {x}/{y}.terrain tiles (gzip), EPSG:4326 / TMS; "
             "finest LOD in the folder is used."
         )
@@ -109,7 +118,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.SPACING,
-                self.tr("Distance between points (meters)"),
+                self.tr("Outline point spacing (meters)"),
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=5.0,
                 minValue=0.01,
@@ -118,8 +127,28 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterBoolean(
                 self.ADD_CENTER_POINTS,
-                self.tr("Add centerline points"),
+                self.tr("Add center points"),
                 defaultValue=False,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.CENTER_MODE,
+                self.tr("Center point mode"),
+                options=[
+                    self.tr("Sparse grid"),
+                    self.tr("Legacy chord midpoints"),
+                ],
+                defaultValue=CENTER_MODE_GRID,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.CENTER_GRID_SPACING,
+                self.tr("Center grid spacing (meters)"),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=5.0,
+                minValue=0.01,
             )
         )
         self.addParameter(
@@ -138,6 +167,12 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         add_center_points = self.parameterAsBool(
             parameters, self.ADD_CENTER_POINTS, context
         )
+        center_mode = self.parameterAsEnum(
+            parameters, self.CENTER_MODE, context
+        )
+        center_grid_spacing = self.parameterAsDouble(
+            parameters, self.CENTER_GRID_SPACING, context
+        )
 
         if layer is None:
             raise QgsProcessingException(self.tr("Invalid polygon layer."))
@@ -147,7 +182,11 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             )
         if spacing <= 0:
             raise QgsProcessingException(
-                self.tr("Spacing must be > 0.")
+                self.tr("Outline spacing must be > 0.")
+            )
+        if center_grid_spacing <= 0:
+            raise QgsProcessingException(
+                self.tr("Center grid spacing must be > 0.")
             )
 
         feedback.setProgressText(self.tr("Opening quantized-mesh…"))
@@ -165,16 +204,22 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
         if add_center_points:
-            feedback.pushInfo(
-                self.tr(
-                    "Centerline points ON (dense mid-chords; "
-                    "Unreal can ignore points below the road plane)."
+            if center_mode == CENTER_MODE_LEGACY_CHORDS:
+                feedback.pushInfo(
+                    self.tr(
+                        "Center points ON — legacy chord midpoints "
+                        f"(outline spacing {spacing} m)."
+                    )
                 )
-            )
+            else:
+                feedback.pushInfo(
+                    self.tr(
+                        "Center points ON — sparse grid "
+                        f"(spacing {center_grid_spacing} m)."
+                    )
+                )
         else:
-            feedback.pushInfo(
-                self.tr("Outline points only (centerline points OFF).")
-            )
+            feedback.pushInfo(self.tr("Outline points only (centers OFF)."))
 
         source_crs = layer.sourceCrs()
         metric_crs = self._metric_crs_for_layer(layer, feedback)
@@ -206,38 +251,40 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 self.tr("Could not create output sink.")
             )
 
-        n_poly = max(layer.featureCount(), 1)
+        features = list(layer.getFeatures())
+        n_poly = max(len(features), 1)
         written_outline = 0
         written_center = 0
         null_alt = 0
+        progress = _Progress(feedback, n_poly, self.tr)
 
-        feedback.setProgressText(self.tr("Sampling outline points…"))
-        for i, feature in enumerate(layer.getFeatures()):
+        for i, feature in enumerate(features):
             if feedback.isCanceled():
                 break
-            if i % 50 == 0:
-                feedback.setProgress(int(90.0 * i / n_poly))
-                feedback.setProgressText(
-                    self.tr(
-                        f"Polygons {i + 1}/{layer.featureCount()} "
-                        f"(outline={written_outline}, "
-                        f"center={written_center})"
-                    )
-                )
 
+            progress.begin_polygon(i, feature.id())
             geom = feature.geometry()
             if geom is None or geom.isEmpty():
+                progress.finish_polygon(
+                    written_outline, written_center, "empty"
+                )
                 continue
 
-            for ring in self._all_rings(geom):
-                if not ring or len(ring) < 2:
-                    continue
+            rings = [r for r in self._all_rings(geom) if r and len(r) >= 2]
+            n_rings = max(len(rings), 1)
+            for r_idx, ring in enumerate(rings):
+                if feedback.isCanceled():
+                    break
                 metric_ring = []
                 for pt in ring:
                     mpt = to_metric.transform(QgsPointXY(pt[0], pt[1]))
                     metric_ring.append((mpt.x(), mpt.y()))
 
-                for mx, my in self._densify_ring(metric_ring, spacing):
+                densified = list(self._densify_ring(metric_ring, spacing))
+                n_pts = max(len(densified), 1)
+                for p_idx, (mx, my) in enumerate(densified):
+                    if feedback.isCanceled():
+                        break
                     alt_f, z, ok = self._sample_metric_xy(
                         mx, my, to_source, to_wgs84, sampler
                     )
@@ -252,34 +299,87 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                     sink.addFeature(out, QgsFeatureSink.FastInsert)
                     written_outline += 1
 
-            if not add_center_points:
-                continue
+                    if p_idx % 100 == 0 or p_idx + 1 == n_pts:
+                        # Outline uses first half of this polygon's budget.
+                        ring_frac = (r_idx + (p_idx + 1) / n_pts) / n_rings
+                        outline_frac = 0.5 * ring_frac
+                        progress.update(
+                            outline_frac,
+                            (
+                                f"outline ring {r_idx + 1}/{n_rings}, "
+                                f"point {p_idx + 1}/{n_pts} "
+                                f"(outline={written_outline}, "
+                                f"center={written_center})"
+                            ),
+                        )
 
-            for metric_poly in self._metric_polygon_parts(geom, to_metric):
-                if feedback.isCanceled():
-                    break
-                centers = self._sample_center_points(
-                    metric_poly,
-                    spacing,
-                    to_source,
-                    to_wgs84,
-                    sampler,
-                )
-                for cx, cy, alt_f, z in centers:
-                    out = QgsFeature(fields)
-                    src_pt = to_source.transform(QgsPointXY(cx, cy))
-                    out.setGeometry(
-                        QgsGeometry(QgsPoint(src_pt.x(), src_pt.y(), z))
-                    )
-                    out.setAttributes([alt_f, ROLE_CENTER])
-                    sink.addFeature(out, QgsFeatureSink.FastInsert)
-                    written_center += 1
+            if add_center_points and not feedback.isCanceled():
+                parts = list(self._metric_polygon_parts(geom, to_metric))
+                n_parts = max(len(parts), 1)
+                for part_idx, metric_poly in enumerate(parts):
+                    if feedback.isCanceled():
+                        break
+
+                    def _center_progress(done, total, label="centers"):
+                        part_base = part_idx / n_parts
+                        part_span = 1.0 / n_parts
+                        local = (done / max(total, 1)) if total else 1.0
+                        frac = 0.5 + 0.5 * (part_base + part_span * local)
+                        progress.update(
+                            frac,
+                            (
+                                f"{label} part {part_idx + 1}/{n_parts}, "
+                                f"{done}/{max(total, 1)} "
+                                f"(outline={written_outline}, "
+                                f"center={written_center})"
+                            ),
+                        )
+
+                    if center_mode == CENTER_MODE_LEGACY_CHORDS:
+                        centers = self._sample_center_points_legacy_chords(
+                            metric_poly,
+                            spacing,
+                            to_source,
+                            to_wgs84,
+                            sampler,
+                            feedback,
+                            _center_progress,
+                        )
+                    else:
+                        centers = self._sample_center_points_grid(
+                            metric_poly,
+                            center_grid_spacing,
+                            to_source,
+                            to_wgs84,
+                            sampler,
+                            feedback,
+                            _center_progress,
+                        )
+
+                    for cx, cy, alt_f, z in centers:
+                        out = QgsFeature(fields)
+                        src_pt = to_source.transform(QgsPointXY(cx, cy))
+                        out.setGeometry(
+                            QgsGeometry(QgsPoint(src_pt.x(), src_pt.y(), z))
+                        )
+                        out.setAttributes([alt_f, ROLE_CENTER])
+                        sink.addFeature(out, QgsFeatureSink.FastInsert)
+                        written_center += 1
+
+            progress.finish_polygon(written_outline, written_center, "done")
 
         feedback.setProgress(100)
+        mode_note = ""
+        if add_center_points:
+            if center_mode == CENTER_MODE_LEGACY_CHORDS:
+                mode_note = ", centers=legacy chords"
+            else:
+                mode_note = f", centers=grid {center_grid_spacing} m"
         feedback.pushInfo(
             self.tr(
                 f"Wrote {written_outline} outline + {written_center} center "
-                f"points (altitude null={null_alt}, spacing={spacing} m)."
+                f"points (altitude null={null_alt}, outline spacing="
+                f"{spacing} m{mode_note})."
             )
         )
         return {self.OUTPUT: dest_id}
@@ -297,25 +397,95 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             return None, 0.0, False
         return alt_f, alt_f, True
 
-    def _sample_center_points(
+    def _sample_center_points_grid(
+        self,
+        metric_poly,
+        grid_spacing,
+        to_source,
+        to_wgs84,
+        sampler,
+        feedback,
+        progress_cb,
+    ):
+        """Sparse axis-aligned grid of points inside the polygon."""
+        if grid_spacing <= 0:
+            return []
+
+        bbox = metric_poly.boundingBox()
+        if bbox.isEmpty():
+            return []
+
+        xmin = bbox.xMinimum()
+        ymin = bbox.yMinimum()
+        xmax = bbox.xMaximum()
+        ymax = bbox.yMaximum()
+
+        # Snap grid origin to spacing so neighboring polygons share phase.
+        x0 = math.floor(xmin / grid_spacing) * grid_spacing
+        y0 = math.floor(ymin / grid_spacing) * grid_spacing
+
+        xs = []
+        x = x0
+        while x <= xmax + 1e-9:
+            if x >= xmin - 1e-9:
+                xs.append(x)
+            x += grid_spacing
+        ys = []
+        y = y0
+        while y <= ymax + 1e-9:
+            if y >= ymin - 1e-9:
+                ys.append(y)
+            y += grid_spacing
+
+        total = max(len(xs) * len(ys), 1)
+        out = []
+        checked = 0
+        for yi, cy in enumerate(ys):
+            if feedback.isCanceled():
+                break
+            for cx in xs:
+                checked += 1
+                pt = QgsGeometry.fromPointXY(QgsPointXY(cx, cy))
+                if not metric_poly.contains(pt):
+                    if checked % 250 == 0 or checked == total:
+                        progress_cb(checked, total, "grid")
+                    continue
+                alt_f, z, ok = self._sample_metric_xy(
+                    cx, cy, to_source, to_wgs84, sampler
+                )
+                if not ok:
+                    if checked % 250 == 0 or checked == total:
+                        progress_cb(checked, total, "grid")
+                    continue
+                out.append((cx, cy, alt_f, z))
+                if checked % 100 == 0 or checked == total:
+                    progress_cb(checked, total, "grid")
+            # Always tick once per row on long polygons.
+            if yi % 5 == 0 or yi + 1 == len(ys):
+                progress_cb(checked, total, "grid")
+
+        progress_cb(total, total, "grid")
+        return out
+
+    def _sample_center_points_legacy_chords(
         self,
         metric_poly,
         spacing,
         to_source,
         to_wgs84,
         sampler,
+        feedback,
+        progress_cb,
     ):
         """
-        Return dense (cx, cy, alt, z) chord midpoints across the polygon.
+        Legacy: chord midpoints across the polygon from outline normals.
 
-        No height filtering: emit centers even where mesh is below the
-        left–right road plane; Unreal can ignore those.
+        Kept so we can compare / revert if the sparse grid is worse.
         """
         exterior = self._exterior_ring_xy(metric_poly)
         if exterior is None or len(exterior) < 3:
             return []
 
-        # Slightly denser outline walk → more cross-sections / centers.
         step = max(spacing * 0.5, 0.25)
         densified = list(self._densify_ring(exterior, step))
         if len(densified) < 3:
@@ -330,11 +500,15 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         min_chord = max(spacing * 0.25, 0.5)
         inset = max(min(spacing * 0.05, 0.25), 0.02)
 
-        # One point per cell; keep highest mesh altitude in the cell.
         best = {}
         cell = max(spacing * 0.5, 0.25)
         n = len(densified)
         for i, (mx, my) in enumerate(densified):
+            if feedback.isCanceled():
+                break
+            if i % 50 == 0 or i + 1 == n:
+                progress_cb(i + 1, n, "legacy chords")
+
             prev_pt = densified[(i - 1) % n]
             next_pt = densified[(i + 1) % n]
             tx = next_pt[0] - prev_pt[0]
@@ -406,6 +580,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             if prev is None or z_c > prev[0]:
                 best[key] = (z_c, cx, cy, z_c, z_geom)
 
+        progress_cb(n, n, "legacy chords")
         return [
             (cx, cy, alt, z)
             for (_rank, cx, cy, alt, z) in best.values()
@@ -437,7 +612,6 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                     best_len = length
                     best = QgsGeometry.fromPolylineXY(part)
             return best
-        # GeometryCollection / mixed: pick longest line among parts.
         best = None
         best_len = -1.0
         parts = geom.asGeometryCollection() or []
@@ -522,7 +696,6 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             return
 
         pts = list(ring)
-        # Drop closing duplicate if present.
         if (
             len(pts) >= 2
             and abs(pts[0][0] - pts[-1][0]) < 1e-9
@@ -534,7 +707,6 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 yield pts[0]
             return
 
-        # Close for walking edges, then don't emit the final close twice.
         closed = pts + [pts[0]]
         yield closed[0]
         for i in range(len(closed) - 1):
@@ -593,3 +765,43 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             f"(layer CRS was {crs.authid() or 'unknown'})."
         )
         return metric
+
+
+class _Progress:
+    """Per-polygon progress: bar moves within each feature, text shows phase."""
+
+    def __init__(self, feedback, n_poly, tr):
+        self.feedback = feedback
+        self.n_poly = max(n_poly, 1)
+        self.tr = tr
+        self.index = 0
+        self.fid = None
+        self._last_pct = -1
+
+    def begin_polygon(self, index, fid):
+        self.index = index
+        self.fid = fid
+        self.update(0.0, "starting")
+
+    def update(self, local_frac, detail):
+        local_frac = max(0.0, min(1.0, float(local_frac)))
+        overall = (self.index + local_frac) / self.n_poly
+        pct = int(100.0 * overall)
+        if pct != self._last_pct or local_frac in (0.0, 1.0):
+            self._last_pct = pct
+            self.feedback.setProgress(min(pct, 99))
+        self.feedback.setProgressText(
+            self.tr(
+                f"Polygon {self.index + 1}/{self.n_poly} "
+                f"(id={self.fid}): {detail}"
+            )
+        )
+
+    def finish_polygon(self, written_outline, written_center, detail):
+        self.update(
+            1.0,
+            (
+                f"{detail} — totals outline={written_outline}, "
+                f"center={written_center}"
+            ),
+        )

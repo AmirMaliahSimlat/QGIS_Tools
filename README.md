@@ -7,7 +7,7 @@ scripts/
   quantized_mesh.py      # shared Cesium quantized-mesh reader
   building_altitude/     # Building altitude + random height
   water_altitude/        # Water median altitude from mesh
-  mask_points/           # Polygon mask → outline (+ optional center pops) + altitude
+  mask_points/           # Polygon mask → outline (+ optional center grid/legacy) + altitude
   line_of_sight/         # Line-of-Sight checker
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
@@ -83,11 +83,16 @@ Folder: [`scripts/mask_points/`](scripts/mask_points/)
 | [`polygon_mask_points.py`](scripts/mask_points/polygon_mask_points.py) | QGIS Processing algorithm |
 | Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh reader |
 
-Samples **PointZ** features along polygon **outlines** (exterior rings **and holes**), at a chosen spacing in meters. Vertices are always kept; intermediate stations are added along edges. Each point gets hardcoded `altitude` from the quantized mesh plus `point_role` (`outline` or `center`).
+Samples **PointZ** features along polygon **outlines** (exterior rings **and holes**), at a chosen **outline spacing** in meters. Vertices are always kept; intermediate stations are added along edges. Each point gets hardcoded `altitude` from the quantized mesh plus `point_role` (`outline` or `center`).
 
-Unlike the tree tool, no fill packing is done by default.
+Optional toggle **Add center points** (off by default):
 
-Optional toggle **Add centerline points** (off by default): densely samples chord midpoints across each exterior ring and writes mesh altitude there — including places where terrain is below the road plane. The Unreal road plugin can ignore those lower centers. Leave the toggle off for outline-only output. The spacing input controls both outline densify and approximate center spacing.
+| Center mode | Behavior |
+| --- | --- |
+| **Sparse grid** (default) | Axis-aligned grid inside each polygon part; spacing from **Center grid spacing (meters)** |
+| **Legacy chord midpoints** | Older inward-perpendicular chord midpoints (kept for comparison / possible revert) |
+
+Centers include places below the road plane; Unreal can ignore those. Progress text updates per polygon with outline/center sub-steps so long features do not look stalled.
 
 ### Install / run in QGIS
 
