@@ -6,6 +6,8 @@ Small QGIS Processing tools for GIS workflows.
 scripts/
   quantized_mesh.py      # shared Cesium quantized-mesh reader
   building_altitude/     # Building altitude + random height
+  water_altitude/        # Water median altitude from mesh
+  mask_points/           # Polygon mask → outline (+ optional center pops) + altitude
   line_of_sight/         # Line-of-Sight checker
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
@@ -52,6 +54,47 @@ python "scripts\building_altitude\generate_altitude_shapefile.py" --min 0 --max 
 ```
 
 Output: `Building Altitude Outputs/B_BUILDINGS_A_with_altitude_precise.gpkg`
+
+## Water median quantized-mesh altitude
+
+Folder: [`scripts/water_altitude/`](scripts/water_altitude/)
+
+| File | Role |
+| --- | --- |
+| [`water_median_altitude.py`](scripts/water_altitude/water_median_altitude.py) | QGIS Processing algorithm |
+| Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh reader |
+
+Adds hardcoded **`altitude`** = **median** mesh elevation for each water polygon.
+
+Samples exterior-ring vertices and edge midpoints, a point-on-surface, and a light interior grid (default step **25 m**; set to **0** for outline-only). Meant for lakes/ponds (one flat elevation per feature). No valid samples → NULL.
+
+### Install / run in QGIS
+
+1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
+2. Select `scripts/water_altitude/water_median_altitude.py` (keep `quantized_mesh.py` available)
+3. Run **QGIS Projects → Water median quantized-mesh altitude**
+
+## Polygon mask points with altitude
+
+Folder: [`scripts/mask_points/`](scripts/mask_points/)
+
+| File | Role |
+| --- | --- |
+| [`polygon_mask_points.py`](scripts/mask_points/polygon_mask_points.py) | QGIS Processing algorithm |
+| Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh reader |
+
+Samples **PointZ** features along polygon **outlines** (exterior rings **and holes**), at a chosen spacing in meters. Vertices are always kept; intermediate stations are added along edges. Each point gets hardcoded `altitude` from the quantized mesh plus `point_role` (`outline` or `center`).
+
+Unlike the tree tool, no fill packing is done by default.
+
+Optional toggle **Add centerline points** (off by default): densely samples chord midpoints across each exterior ring and writes mesh altitude there — including places where terrain is below the road plane. The Unreal road plugin can ignore those lower centers. Leave the toggle off for outline-only output. The spacing input controls both outline densify and approximate center spacing.
+
+### Install / run in QGIS
+
+1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
+2. Select `scripts/mask_points/polygon_mask_points.py` (keep `quantized_mesh.py` available)
+3. Run **QGIS Projects → Polygon mask points with altitude**
+4. If you still have the old script loaded, remove `polygon_outline_points.py` from the QGIS scripts folder
 
 ## Line-of-Sight checker
 
