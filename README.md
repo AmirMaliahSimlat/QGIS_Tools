@@ -7,7 +7,8 @@ scripts/
   quantized_mesh.py      # shared Cesium quantized-mesh reader
   building_altitude/     # Building altitude + random height
   water_altitude/        # Water median altitude from mesh
-  mask_points/           # Polygon mask → outline (+ optional center grid/legacy) + altitude
+  mask_points/           # Polygon mask → outline (+ optional legacy centers)
+  mesh_flatten/          # Flatten quantized mesh under roads (Delaunay Z)
   line_of_sight/         # Line-of-Sight checker
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
@@ -85,14 +86,7 @@ Folder: [`scripts/mask_points/`](scripts/mask_points/)
 
 Samples **PointZ** features along polygon **outlines** (exterior rings **and holes**), at a chosen **outline spacing** in meters. Vertices are always kept; intermediate stations are added along edges. Each point gets hardcoded `altitude` from the quantized mesh plus `point_role` (`outline` or `center`).
 
-Optional toggle **Add center points** (off by default):
-
-| Center mode | Behavior |
-| --- | --- |
-| **Sparse grid** (default) | Axis-aligned grid inside each polygon part; spacing from **Center grid spacing (meters)** |
-| **Legacy chord midpoints** | Older inward-perpendicular chord midpoints (kept for comparison / possible revert) |
-
-Centers include places below the road plane; Unreal can ignore those. Progress text updates per polygon with outline/center sub-steps so long features do not look stalled.
+Optional toggle **Add center points (legacy)** (off by default): older sparse-grid / chord-midpoint center samples. Prefer **Flatten road masks in quantized mesh** so Unreal and the DTM share the same outline-Delaunay surface.
 
 ### Install / run in QGIS
 
@@ -100,6 +94,30 @@ Centers include places below the road plane; Unreal can ignore those. Progress t
 2. Select `scripts/mask_points/polygon_mask_points.py` (keep `quantized_mesh.py` available)
 3. Run **QGIS Projects → Polygon mask points with altitude**
 4. If you still have the old script loaded, remove `polygon_outline_points.py` from the QGIS scripts folder
+
+## Flatten road masks in quantized mesh
+
+Folder: [`scripts/mesh_flatten/`](scripts/mesh_flatten/)
+
+| File | Role |
+| --- | --- |
+| [`flatten_road_mesh.py`](scripts/mesh_flatten/flatten_road_mesh.py) | QGIS Processing algorithm |
+| Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh read / height rewrite |
+
+**Run after** generating outline PointZ (mask-points tool, centers off). Copies the input tileset to a new folder (never overwrites). Sample selection and TIN rules match **Unreal RoadPlacer**:
+
+- PointZ on/near mask (**15 m** snap default) or inside mask
+- Drop sagging interiors (1.5 m curb band; optional proud threshold)
+- Inject mask ring vertices with nearest PointZ height
+- 2D Delaunay; keep triangles whose centroid is inside the mask; set mesh vertices inside the mask to that linear Z
+
+Processes **all** `.terrain` tiles under the folder (`{x}/{y}` and `{level}/{x}/{y}`).
+
+### Install / run in QGIS
+
+1. Add `scripts/mesh_flatten/flatten_road_mesh.py` to the toolbox (keep `quantized_mesh.py` available)
+2. Run **QGIS Projects → Flatten road masks in quantized mesh**
+3. Inputs: road masks, outline points + altitude field, input mesh folder, empty/new output folder, near-mask snap (default **15 m**), interior proud (default **0**)
 
 ## Line-of-Sight checker
 

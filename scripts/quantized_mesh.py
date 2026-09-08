@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Quantized-mesh terrain helpers for sampling altitudes.
+Quantized-mesh terrain helpers for sampling and rewriting altitudes.
 
-Expects a single-LOD Cesium tileset on disk as:
+Supports Cesium tilesets on disk as either:
   {root}/{x}/{y}.terrain
+  {root}/{level}/{x}/{y}.terrain
 
 Defaults match Cesium quantized-mesh: EPSG:4326 (geographic) + TMS
-(y increasing northward). Tiles are gzip-compressed.
+(y increasing northward). Tiles are usually gzip-compressed.
 """
 
 from __future__ import annotations
@@ -24,6 +25,11 @@ HEADER_BYTES = 88
 
 def zig_zag_decode(value: int) -> int:
     return (value >> 1) ^ (-(value & 1))
+
+
+def zig_zag_encode(value: int) -> int:
+    """Inverse of zig_zag_decode for signed integers."""
+    return (value << 1) if value >= 0 else ((-value << 1) - 1)
 
 
 def decode_high_water_mark(indices: List[int]) -> List[int]:
@@ -279,3 +285,132 @@ class QuantizedMeshSampler:
             tile = None
         self._cache[key] = tile
         return tile
+
+
+def discover_terrain_tiles(root: Path) -> List[Tuple[Path, int, int, int]]:
+    """
+    Return [(abs_path, level, x, y), ...] for every .terrain under root.
+
+    Layouts:
+      {root}/{x}/{y}.terrain              → level auto-detected once
+      {root}/{level}/{x}/{y}.terrain      → level from folder name
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError(f"Quantized-mesh folder not found: {root}")
+
+    flat: List[Tuple[Path, int, int]] = []
+    leveled: List[Tuple[Path, int, int, int]] = []
+
+    for path in root.rglob("*.terrain"):
+        if not path.stem.isdigit():
+            continue
+        rel = path.relative_to(root)
+        parts = rel.parts
+        if len(parts) == 2 and parts[0].isdigit():
+            flat.append((path, int(parts[0]), int(path.stem)))
+        elif len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            leveled.append(
+                (path, int(parts[0]), int(parts[1]), int(path.stem))
+            )
+
+    out: List[Tuple[Path, int, int, int]] = []
+    if leveled:
+        out.extend(leveled)
+    if flat:
+        level = detect_geographic_level(
+            root, [(x, y) for _p, x, y in flat]
+        )
+        out.extend((p, level, x, y) for p, x, y in flat)
+    if not out:
+        raise ValueError(f"No .terrain tiles under: {root}")
+    return out
+
+
+def _quantize_height(alt: float, min_alt: float, max_alt: float) -> int:
+    if max_alt <= min_alt:
+        return 0
+    t = (alt - min_alt) / (max_alt - min_alt)
+    q = int(round(t * QUANTIZATION))
+    return max(0, min(int(QUANTIZATION), q))
+
+
+def _encode_delta_u16(values: List[int]) -> List[int]:
+    encoded = []
+    prev = 0
+    for value in values:
+        encoded.append(zig_zag_encode(int(value) - prev))
+        prev = int(value)
+    return encoded
+
+
+def replace_tile_altitudes(
+    data: bytes,
+    level: int,
+    x: int,
+    y: int,
+    altitudes: List[float],
+) -> bytes:
+    """
+    Return a new uncompressed tile buffer with vertex altitudes replaced.
+
+    ``altitudes`` must match the tile vertex count. Header MinimumHeight /
+    MaximumHeight are updated to the new altitude range. U/V, indices, and
+    trailing extensions are preserved.
+    """
+    if len(data) < HEADER_BYTES + 4:
+        raise ValueError("Tile too small")
+
+    vertex_count = struct.unpack_from("<I", data, HEADER_BYTES)[0]
+    if len(altitudes) != vertex_count:
+        raise ValueError(
+            f"Altitude count {len(altitudes)} != vertex count {vertex_count}"
+        )
+
+    off = HEADER_BYTES + 4
+    u_bytes = 2 * vertex_count
+    v_bytes = 2 * vertex_count
+    h_bytes = 2 * vertex_count
+    u_off = off
+    v_off = off + u_bytes
+    h_off = off + u_bytes + v_bytes
+    after_h = h_off + h_bytes
+
+    min_alt = float(min(altitudes))
+    max_alt = float(max(altitudes))
+    if max_alt <= min_alt:
+        max_alt = min_alt + 1.0
+
+    abs_h = [_quantize_height(a, min_alt, max_alt) for a in altitudes]
+    enc_h = _encode_delta_u16(abs_h)
+
+    out = bytearray(data)
+    struct.pack_into("<ff", out, 24, float(min_alt), float(max_alt))
+    struct.pack_into("<" + "H" * vertex_count, out, h_off, *enc_h)
+    # Keep everything before heights and after heights unchanged (u/v + rest).
+    # u/v already in out from data copy; we only patched header + heights.
+    _ = (u_off, v_off, after_h)  # documenting layout
+    return bytes(out)
+
+
+def load_tile_altitudes_lonlat(
+    path: Path, level: int, x: int, y: int
+) -> Tuple[bytes, bool, List[float], List[float], List[float]]:
+    """
+    Load a tile.
+
+    Returns (raw_uncompressed, was_gzip, lons, lats, altitudes).
+    """
+    raw = path.read_bytes()
+    was_gzip = raw[:2] == b"\x1f\x8b"
+    data = gzip.decompress(raw) if was_gzip else raw
+    tile = load_tile(path, level, x, y)
+    return data, was_gzip, tile.lons, tile.lats, list(tile.altitudes)
+
+
+def write_terrain_file(path: Path, data: bytes, use_gzip: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if use_gzip:
+        path.write_bytes(gzip.compress(data, compresslevel=6))
+    else:
+        path.write_bytes(data)

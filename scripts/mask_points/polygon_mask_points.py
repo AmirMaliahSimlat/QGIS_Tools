@@ -91,11 +91,9 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             "terrain altitude from a Cesium quantized-mesh tileset.\n\n"
             f"Output is PointZ with '{ALTITUDE_FIELD}' and '{ROLE_FIELD}' "
             f"('{ROLE_OUTLINE}' or '{ROLE_CENTER}').\n\n"
-            "Optional: Add center points inside each mask. Default mode is "
-            "a sparse axis-aligned grid (set grid spacing separately). "
-            "Legacy mode keeps the older chord-midpoint centerline walk. "
-            "Centers are written even where terrain is below the road "
-            "plane — the Unreal road plugin can ignore those.\n\n"
+            "Optional (legacy): Add center points inside each mask — sparse "
+            "grid or chord midpoints. Prefer flattening the quantized mesh "
+            "with 'Flatten road masks in quantized mesh' instead.\n\n"
             "Expects {x}/{y}.terrain tiles (gzip), EPSG:4326 / TMS; "
             "finest LOD in the folder is used."
         )
@@ -127,17 +125,17 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterBoolean(
                 self.ADD_CENTER_POINTS,
-                self.tr("Add center points"),
+                self.tr("Add center points (legacy)"),
                 defaultValue=False,
             )
         )
         self.addParameter(
             QgsProcessingParameterEnum(
                 self.CENTER_MODE,
-                self.tr("Center point mode"),
+                self.tr("Center point mode (legacy)"),
                 options=[
-                    self.tr("Sparse grid"),
-                    self.tr("Legacy chord midpoints"),
+                    self.tr("Sparse grid (legacy)"),
+                    self.tr("Chord midpoints (legacy)"),
                 ],
                 defaultValue=CENTER_MODE_GRID,
             )
@@ -145,7 +143,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.CENTER_GRID_SPACING,
-                self.tr("Center grid spacing (meters)"),
+                self.tr("Center grid spacing meters (legacy)"),
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=5.0,
                 minValue=0.01,
