@@ -9,6 +9,7 @@ Never overwrites the input tileset; writes a full copy then patches tiles.
 import math
 import os
 import shutil
+import subprocess
 import sys
 
 from qgis.PyQt.QtCore import QCoreApplication
@@ -21,6 +22,7 @@ from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterField,
     QgsProcessingParameterFile,
@@ -28,6 +30,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
     QgsProject,
+    QgsRectangle,
     QgsSpatialIndex,
     QgsUnitTypes,
     QgsWkbTypes,
@@ -52,8 +55,10 @@ ROLE_OUTLINE = "outline"
 
 # Match RoadPlacer (RoadPlacerBPLibrary.cpp).
 UNREAL_OUTLINE_SNAP_M = 15.0
-UNREAL_OUTLINE_BAND_M = 1.5
-UNREAL_INTERIOR_PROUD_M = 0.0
+
+# Optional interior carve: keep edge strip at TIN Z, drop deeper interior.
+DEFAULT_EDGE_STRIP_M = 0.5
+DEFAULT_INTERIOR_DROP_M = 0.5
 
 
 class _PhaseProgress:
@@ -96,7 +101,11 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
     INPUT_MESH = "INPUT_MESH"
     OUTPUT_MESH = "OUTPUT_MESH"
     NEAR_DISTANCE = "NEAR_DISTANCE"
-    INTERIOR_PROUD = "INTERIOR_PROUD"
+    LOWER_INTERIOR = "LOWER_INTERIOR"
+    EDGE_STRIP = "EDGE_STRIP"
+    INTERIOR_DROP = "INTERIOR_DROP"
+    LOWERING_ONLY = "LOWERING_ONLY"
+    SMOOTH_BLEND = "SMOOTH_BLEND"
 
     def tr(self, string):
         return QCoreApplication.translate("Processing", string)
@@ -120,15 +129,19 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         return self.tr(
             "Copies a quantized-mesh tileset and reshapes terrain under road "
             "mask polygons to match the Unreal RoadPlacer surface:\n\n"
-            "1. Elevation PointZ on/near the mask (default snap 15 m, same as "
-            "RoadPlacer) or inside the mask.\n"
-            "2. Drop sagging interior samples below the curb plane "
-            "(1.5 m curb band; optional proud threshold).\n"
-            "3. Inject mask ring vertices (outer + holes) with Z from the "
+            "1. Outline/curb PointZ on/near the mask (default snap 15 m) or "
+            "inside the mask. Interior/center points are ignored "
+            "(point_role=center skipped when present).\n"
+            "2. Inject mask ring vertices (outer + holes) with Z from the "
             "nearest elevation sample.\n"
-            "4. 2D Delaunay on XY; keep triangles whose centroid is inside "
+            "3. 2D Delaunay on XY; keep triangles whose centroid is inside "
             "the mask; set every mesh vertex inside the mask to that "
             "triangle’s linear Z.\n\n"
+            "Optional: lower the interior — either a smooth blend (0 at curb "
+            "→ full drop across the edge width) or a stair step (0 in the "
+            "outer strip, full drop inside).\n\n"
+            "Interior-lowering-only mode skips TIN flatten: point your input "
+            "at an already-flattened mesh; outline points are not required.\n\n"
             "Off-mask vertices stay unchanged. Input mesh is never "
             "overwritten. Supports {x}/{y}.terrain and "
             "{level}/{x}/{y}.terrain layouts."
@@ -145,17 +158,21 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_OUTLINE_POINTS,
-                self.tr("Outline points (PointZ from mask-points tool)"),
+                self.tr(
+                    "Outline points (PointZ; not needed for lowering-only)"
+                ),
                 [QgsProcessing.TypeVectorPoint],
+                optional=True,
             )
         )
         self.addParameter(
             QgsProcessingParameterField(
                 self.ALTITUDE_FIELD,
-                self.tr("Altitude field"),
+                self.tr("Altitude field (not needed for lowering-only)"),
                 parentLayerParameterName=self.INPUT_OUTLINE_POINTS,
                 type=QgsProcessingParameterField.Numeric,
                 defaultValue=ALTITUDE_FIELD_DEFAULT,
+                optional=True,
             )
         )
         self.addParameter(
@@ -183,13 +200,53 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
-            QgsProcessingParameterNumber(
-                self.INTERIOR_PROUD,
+            QgsProcessingParameterBoolean(
+                self.LOWERING_ONLY,
                 self.tr(
-                    "Interior proud meters (Unreal; 0 = drop any sag)"
+                    "Interior lowering only (skip TIN flatten; "
+                    "use already-flattened mesh as input)"
+                ),
+                defaultValue=False,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.LOWER_INTERIOR,
+                self.tr(
+                    "Lower interior under mask"
+                ),
+                defaultValue=False,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.SMOOTH_BLEND,
+                self.tr(
+                    "Smooth edge blend (off = stair: outer strip flat, "
+                    "full drop inside)"
+                ),
+                defaultValue=True,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.EDGE_STRIP,
+                self.tr(
+                    "Edge strip / blend width (meters)"
                 ),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=UNREAL_INTERIOR_PROUD_M,
+                defaultValue=DEFAULT_EDGE_STRIP_M,
+                minValue=0.0,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.INTERIOR_DROP,
+                self.tr(
+                    "Max interior drop (meters)"
+                ),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=DEFAULT_INTERIOR_DROP_M,
                 minValue=0.0,
             )
         )
@@ -209,24 +266,65 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         near_m = self.parameterAsDouble(
             parameters, self.NEAR_DISTANCE, context
         )
-        proud_m = self.parameterAsDouble(
-            parameters, self.INTERIOR_PROUD, context
+        lowering_only = self.parameterAsBool(
+            parameters, self.LOWERING_ONLY, context
+        )
+        lower_interior = self.parameterAsBool(
+            parameters, self.LOWER_INTERIOR, context
+        )
+        edge_strip_m = self.parameterAsDouble(
+            parameters, self.EDGE_STRIP, context
+        )
+        interior_drop_m = self.parameterAsDouble(
+            parameters, self.INTERIOR_DROP, context
+        )
+        smooth_blend = self.parameterAsBool(
+            parameters, self.SMOOTH_BLEND, context
         )
 
         if masks_layer is None:
             raise QgsProcessingException(self.tr("Invalid mask layer."))
-        if points_source is None:
-            raise QgsProcessingException(self.tr("Invalid outline points."))
-        if not alt_field:
-            raise QgsProcessingException(self.tr("Altitude field required."))
         if not mesh_in or not os.path.isdir(mesh_in):
             raise QgsProcessingException(self.tr("Invalid input mesh folder."))
         if not mesh_out:
             raise QgsProcessingException(self.tr("Output mesh folder required."))
         if near_m < 0:
             raise QgsProcessingException(self.tr("Near-mask snap must be ≥ 0."))
-        if proud_m < 0:
-            raise QgsProcessingException(self.tr("Interior proud must be ≥ 0."))
+        if edge_strip_m < 0:
+            raise QgsProcessingException(self.tr("Edge blend width must be ≥ 0."))
+        if interior_drop_m < 0:
+            raise QgsProcessingException(self.tr("Interior drop must be ≥ 0."))
+
+        # Lowering-only always applies the smooth interior carve.
+        if lowering_only:
+            lower_interior = True
+            if interior_drop_m <= 0.0:
+                raise QgsProcessingException(
+                    self.tr(
+                        "Interior lowering only requires "
+                        "Max interior drop > 0."
+                    )
+                )
+        elif not lower_interior:
+            edge_strip_m = 0.0
+            interior_drop_m = 0.0
+        elif interior_drop_m <= 0.0:
+            feedback.pushInfo(
+                self.tr(
+                    "Lower-interior toggle is on but drop is 0 — "
+                    "terrain will match TIN only (no extra carve)."
+                )
+            )
+
+        if not lowering_only:
+            if points_source is None:
+                raise QgsProcessingException(
+                    self.tr("Invalid outline points.")
+                )
+            if not alt_field:
+                raise QgsProcessingException(
+                    self.tr("Altitude field required.")
+                )
 
         in_path = os.path.abspath(mesh_in)
         out_path = os.path.abspath(mesh_out)
@@ -244,62 +342,64 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
 
         progress = _PhaseProgress(feedback, self.tr)
 
-        # --- Phase 1: copy tileset (0–20%) ---
-        progress.begin("1/5 Copy tileset", 0, 20)
+        # --- Phase 1: copy tileset ---
+        if lowering_only:
+            progress.begin("1/3 Copy tileset", 0, 20)
+        else:
+            progress.begin("1/5 Copy tileset", 0, 20)
         os.makedirs(out_path, exist_ok=True)
-        all_files = []
-        progress.tick(0, 1, "scanning input folder…")
-        for root, _dirs, files in os.walk(in_path):
-            if feedback.isCanceled():
-                raise QgsProcessingException(self.tr("Canceled during scan."))
-            for name in files:
-                all_files.append(os.path.join(root, name))
-        n_files = max(len(all_files), 1)
-        progress.tick(0, n_files, f"0/{n_files} files")
-        for fi, src in enumerate(all_files):
-            if feedback.isCanceled():
-                raise QgsProcessingException(self.tr("Canceled during copy."))
-            rel = os.path.relpath(src, in_path)
-            dst = os.path.join(out_path, rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
-            if fi % 50 == 0 or fi + 1 == n_files:
-                progress.tick(
-                    fi + 1,
-                    n_files,
-                    f"{fi + 1}/{n_files} files ({os.path.basename(src)})",
-                )
+        _fast_copy_tileset(in_path, out_path, feedback, progress, self.tr)
 
-        # --- Phase 2–3: Delaunay surface (20–50%) ---
-        surface = self._build_road_surface(
-            masks_layer,
-            points_source,
-            alt_field,
-            near_m,
-            proud_m,
-            feedback,
-            progress,
-        )
-        if not surface.triangles:
-            raise QgsProcessingException(
+        # --- Build surface (TIN + optional drop, or drop-only) ---
+        if lowering_only:
+            feedback.pushInfo(
                 self.tr(
-                    "No Delaunay triangles kept inside masks. "
-                    "Check outline points, altitude field, and near distance."
+                    "Interior-lowering-only mode: skipping Delaunay / TIN "
+                    f"flatten; drop −{interior_drop_m} m "
+                    f"(strip {edge_strip_m} m, "
+                    f"{'smooth' if smooth_blend else 'stair'})."
                 )
             )
-        feedback.pushInfo(
-            self.tr(
-                f"Kept {len(surface.triangles)} road triangles from "
-                f"{surface.n_outline_used} samples "
-                f"({surface.n_masks} masks; "
-                f"interior kept={surface.interior_kept}, "
-                f"skipped={surface.interior_skipped}, "
-                f"mask-ring verts={surface.n_ring_verts})."
+            progress.begin("2/3 Prepare masks", 20, 40)
+            surface = self._build_lowering_surface(
+                masks_layer,
+                feedback,
+                progress,
+                interior_drop_m=interior_drop_m,
+                edge_blend_m=edge_strip_m,
+                smooth_blend=smooth_blend,
             )
-        )
+            progress.begin("3/3 Lower mesh interiors", 40, 100)
+        else:
+            progress.begin("2/5 Build road TIN", 20, 50)
+            surface = self._build_road_surface(
+                masks_layer,
+                points_source,
+                alt_field,
+                near_m,
+                feedback,
+                progress,
+                interior_drop_m=interior_drop_m,
+                edge_strip_m=edge_strip_m,
+                smooth_blend=smooth_blend,
+            )
+            if not surface.triangles:
+                raise QgsProcessingException(
+                    self.tr(
+                        "No Delaunay triangles kept inside masks. "
+                        "Check outline points, altitude field, and near distance."
+                    )
+                )
+            feedback.pushInfo(
+                self.tr(
+                    f"Kept {len(surface.triangles)} road triangles from "
+                    f"{surface.n_outline_used} samples "
+                    f"({surface.n_masks} masks; "
+                    f"mask-ring verts={surface.n_ring_verts})."
+                )
+            )
+            progress.begin("5/5 Flatten mesh tiles", 50, 100)
 
-        # --- Phase 5: flatten tiles (50–100%) ---
-        progress.begin("5/5 Flatten mesh tiles", 50, 100)
         progress.tick(0, 1, "discovering .terrain files…")
         tiles = discover_terrain_tiles(out_path)
         feedback.pushInfo(self.tr(f"Found {len(tiles)} .terrain tiles."))
@@ -308,13 +408,14 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         changed_verts = 0
         examined = 0
         skipped_bbox = 0
+        skipped_mask = 0
         n_tiles = max(len(tiles), 1)
         for ti, (tile_path, level, tx, ty) in enumerate(tiles):
             if feedback.isCanceled():
                 break
 
             # Always advance the bar, including fast bbox skips.
-            if ti % 5 == 0 or ti + 1 == n_tiles:
+            if ti % 25 == 0 or ti + 1 == n_tiles:
                 rel = os.path.relpath(str(tile_path), out_path)
                 progress.tick(
                     ti + 1,
@@ -323,13 +424,17 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                         f"tile {ti + 1}/{n_tiles} LOD {level} "
                         f"examined={examined} patched={changed_tiles} "
                         f"verts={changed_verts} skip_bbox={skipped_bbox} "
-                        f"| {rel}"
+                        f"skip_mask={skipped_mask} | {rel}"
                     ),
                 )
 
             west, south, east, north = _tile_bounds_deg(level, tx, ty)
             if not surface.bounds_intersect(west, south, east, north):
                 skipped_bbox += 1
+                continue
+            # Overall road extent can be huge; skip tiles that miss every mask.
+            if not surface.tile_hits_mask(west, south, east, north):
+                skipped_mask += 1
                 continue
 
             examined += 1
@@ -350,8 +455,8 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                 if feedback.isCanceled():
                     break
                 # Extra detail on heavy tiles so long vertex loops don't look stuck.
-                if n_verts >= 2000 and (
-                    vi % 500 == 0 or vi + 1 == n_verts
+                if n_verts >= 4000 and (
+                    vi % 2000 == 0 or vi + 1 == n_verts
                 ):
                     progress.tick(
                         ti + (vi + 1) / max(n_verts, 1),
@@ -362,7 +467,7 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                             f"patched={changed_tiles} verts={changed_verts}"
                         ),
                     )
-                new_z = surface.sample_z(lon, lat)
+                new_z = surface.sample_z(lon, lat, current_z=old_z)
                 if new_z is None:
                     continue
                 if abs(new_z - old_z) > 1e-6:
@@ -386,12 +491,13 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
 
         feedback.setProgress(100)
         feedback.setProgressText(self.tr("Finished"))
+        mode = "lowering-only" if lowering_only else "flatten"
         feedback.pushInfo(
             self.tr(
-                f"Done. Copied mesh to {out_path}. "
-                f"Examined {examined} tiles in road extent, "
+                f"Done ({mode}). Copied mesh to {out_path}. "
+                f"Examined {examined} tiles that hit masks, "
                 f"patched {changed_tiles} tiles, {changed_verts} vertices "
-                f"(bbox-skipped {skipped_bbox})."
+                f"(bbox-skipped {skipped_bbox}, mask-skipped {skipped_mask})."
             )
         )
         return {self.OUTPUT_MESH: out_path}
@@ -402,13 +508,18 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         points_source,
         alt_field,
         near_m,
-        proud_m,
         feedback,
         progress,
+        interior_drop_m=0.0,
+        edge_strip_m=0.0,
+        smooth_blend=True,
     ):
         """
         Build the same sample set + Delaunay rules as RoadPlacer:
-        snap/inside selection, drop sagging interiors, inject mask rings.
+        snap/inside outline selection, inject mask rings, no interior points.
+
+        If interior_drop_m > 0, subtract a drop based on distance to the mask
+        boundary (smooth blend or stair step over edge_strip_m).
         """
         mask_crs = masks_layer.sourceCrs()
         point_crs = points_source.sourceCrs()
@@ -434,6 +545,7 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 self.tr(f"Altitude field '{alt_field}' not found.")
             )
+        role_idx = fields.indexOf(ROLE_FIELD)
 
         # Prepare mask geometries (metric + WGS84) once.
         progress.begin("2/5 Prepare road masks", 20, 24)
@@ -514,6 +626,10 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                         max(scanned, 1),
                         f"scanned {scanned} (raw {len(raw_pts)})",
                     )
+            if role_idx >= 0:
+                role = feat.attribute(role_idx)
+                if role is not None and str(role).lower() == "center":
+                    continue
             geom = feat.geometry()
             if geom is None or geom.isEmpty():
                 continue
@@ -542,7 +658,7 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
             mask_index.addFeature(f)
 
         # Select like Unreal: inside mask OR within near_m of outline.
-        progress.tick(0, 1, "selecting points on/near masks…")
+        progress.tick(0, 1, "selecting outline points on/near masks…")
         selected = []
         snap_buf = max(near_m, 0.0)
         for pi, (mx, my, lon, lat, z) in enumerate(raw_pts):
@@ -565,7 +681,6 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                     keep = True
                     break
                 if snap_buf > 0:
-                    # Outside but within snap of curb (boundary distance).
                     d = mask_boundaries[gi].distance(pt)
                     if d <= snap_buf:
                         keep = True
@@ -580,22 +695,10 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                     "mask (Unreal-style snap)."
                 )
             )
-
-        # Drop sagging interiors (RoadPlacer DropSaggingInteriorSamples).
-        progress.tick(0, 1, "filtering sagging interior samples…")
-        selected, interior_kept, interior_skipped = _drop_sagging_interiors(
-            selected,
-            masks_metric,
-            mask_boundaries,
-            mask_index,
-            UNREAL_OUTLINE_BAND_M,
-            proud_m,
-            feedback,
-        )
         feedback.pushInfo(
             self.tr(
-                f"After Unreal sample filter: {len(selected)} points "
-                f"(interior kept={interior_kept}, skipped={interior_skipped})."
+                f"Using {len(selected)} outline elevation sample(s) "
+                f"(snap={near_m} m)."
             )
         )
 
@@ -603,17 +706,34 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         # FillMissingHeights).
         progress.begin("4/5 Inject mask rings + Delaunay", 34, 50)
         known_for_fill = list(selected)
+        z_grid, z_cell = _build_nearest_z_grid(known_for_fill, cell=max(near_m, 5.0))
         n_ring_verts = 0
         ring_samples_by_mask = []
+        n_masks_rings = max(len(mask_ring_verts), 1)
+        total_ring_pts = max(sum(len(r) for r in mask_ring_verts), 1)
+        done_ring_pts = 0
         for mi, ring_pts in enumerate(mask_ring_verts):
+            if feedback.isCanceled():
+                break
             filled = []
             for mx, my, lon, lat in ring_pts:
-                z = _nearest_z(mx, my, known_for_fill)
+                z = _nearest_z(mx, my, known_for_fill, z_grid, z_cell)
+                done_ring_pts += 1
                 if z is None:
                     continue
                 filled.append((mx, my, lon, lat, z))
                 n_ring_verts += 1
             ring_samples_by_mask.append(filled)
+            if mi % 10 == 0 or mi + 1 == n_masks_rings:
+                progress.tick(
+                    done_ring_pts,
+                    total_ring_pts,
+                    (
+                        f"fill ring Z mask {mi + 1}/{n_masks_rings} "
+                        f"({done_ring_pts}/{total_ring_pts} verts, "
+                        f"kept={n_ring_verts})"
+                    ),
+                )
         feedback.pushInfo(
             self.tr(
                 f"Injected {n_ring_verts} mask-ring vertices with nearest Z."
@@ -621,7 +741,7 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         )
 
         # Bucket all elevation samples (pointZ + will merge rings per mask).
-        cell = max(near_m, UNREAL_OUTLINE_BAND_M, 1.0)
+        cell = max(near_m, 1.0)
         buckets = {}
         for i, (mx, my, _lo, _la, _z) in enumerate(selected):
             key = (int(math.floor(mx / cell)), int(math.floor(my / cell)))
@@ -667,32 +787,55 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         for mi, metric_geom in enumerate(masks_metric):
             if feedback.isCanceled():
                 break
-            if mi % 5 == 0 or mi + 1 == n_masks_total:
+            samples = samples_for_mask(mi, metric_geom)
+            if len(samples) < 3:
                 progress.tick(
                     mi + 1,
                     n_masks_total,
-                    (
-                        f"Delaunay mask {mi + 1}/{n_masks_total} "
-                        f"triangles={len(triangles)}"
-                    ),
+                    f"skip mask {mi + 1}/{n_masks_total} (few samples)",
                 )
-            samples = samples_for_mask(mi, metric_geom)
-            if len(samples) < 3:
                 continue
+            if len(samples) > 2500:
+                before = len(samples)
+                samples = _thin_samples_metric(samples, cell_m=2.0)
+                if before != len(samples):
+                    feedback.pushInfo(
+                        self.tr(
+                            f"Mask {mi + 1}: thinned {before} → {len(samples)} "
+                            f"samples for Delaunay (2 m grid)."
+                        )
+                    )
+            progress.tick(
+                mi + 1,
+                n_masks_total,
+                (
+                    f"Delaunay mask {mi + 1}/{n_masks_total} "
+                    f"samples={len(samples)} "
+                    f"triangles={len(triangles)}"
+                ),
+            )
             pts_m = [(s[0], s[1]) for s in samples]
             pts_llz = [(s[2], s[3], s[4]) for s in samples]
-            simplices = _delaunay_simplices(pts_m)
+            simplices = _delaunay_simplices(pts_m, feedback)
             if not simplices:
                 continue
             n_masks += 1
             n_outline_used += len(samples)
+            progress.tick(
+                mi + 1,
+                n_masks_total,
+                (
+                    f"clip triangles mask {mi + 1}/{n_masks_total} "
+                    f"raw_tris={len(simplices)} "
+                    f"kept={len(triangles)}"
+                ),
+            )
             for ia, ib, ic in simplices:
                 lon0, lat0, z0 = pts_llz[ia]
                 lon1, lat1, z1 = pts_llz[ib]
                 lon2, lat2, z2 = pts_llz[ic]
                 cx = (pts_m[ia][0] + pts_m[ib][0] + pts_m[ic][0]) / 3.0
                 cy = (pts_m[ia][1] + pts_m[ib][1] + pts_m[ic][1]) / 3.0
-                # Match Unreal PointInMask(centroid): contains/intersects.
                 cpt = QgsGeometry.fromPointXY(QgsPointXY(cx, cy))
                 if not metric_geom.intersects(cpt):
                     continue
@@ -710,6 +853,16 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                     }
                 )
 
+        # Distance-based interior drop on _RoadSurface.
+        if interior_drop_m > 0.0:
+            mode = "smooth blend" if smooth_blend else "stair step"
+            feedback.pushInfo(
+                self.tr(
+                    f"Interior drop enabled: up to −{interior_drop_m} m "
+                    f"below TIN ({mode}, strip {edge_strip_m} m)."
+                )
+            )
+
         progress.tick(
             1,
             1,
@@ -720,10 +873,82 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
             masks_wgs,
             n_outline_used,
             n_masks,
-            interior_kept,
-            interior_skipped,
             n_ring_verts,
             progress,
+            interior_drop_m=interior_drop_m,
+            edge_blend_m=edge_strip_m,
+            masks_metric=masks_metric,
+            metric_crs=metric_crs,
+            smooth_blend=smooth_blend,
+        )
+
+    def _build_lowering_surface(
+        self,
+        masks_layer,
+        feedback,
+        progress,
+        interior_drop_m=0.0,
+        edge_blend_m=0.0,
+        smooth_blend=True,
+    ):
+        """Masks-only surface: subtract an interior drop from existing Z."""
+        mask_crs = masks_layer.sourceCrs()
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        metric_crs = self._metric_crs(masks_layer, feedback)
+        to_metric_mask = QgsCoordinateTransform(
+            mask_crs, metric_crs, QgsProject.instance()
+        )
+        to_wgs_mask = QgsCoordinateTransform(
+            mask_crs, wgs84, QgsProject.instance()
+        )
+
+        masks_metric = []
+        masks_wgs = []
+        mask_feats = list(masks_layer.getFeatures())
+        n_mask_feats = max(len(mask_feats), 1)
+        for mi, feat in enumerate(mask_feats):
+            if feedback.isCanceled():
+                break
+            if mi % 20 == 0 or mi + 1 == n_mask_feats:
+                progress.tick(
+                    mi + 1,
+                    n_mask_feats,
+                    f"mask geom {mi + 1}/{n_mask_feats}",
+                )
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            metric_geom = QgsGeometry(geom)
+            if metric_geom.transform(to_metric_mask) != 0:
+                continue
+            metric_geom = metric_geom.makeValid()
+            if metric_geom.isEmpty():
+                continue
+            wgs_geom = QgsGeometry(geom)
+            if wgs_geom.transform(to_wgs_mask) != 0:
+                continue
+            wgs_geom = wgs_geom.makeValid()
+            if wgs_geom.isEmpty():
+                continue
+            masks_metric.append(metric_geom)
+            masks_wgs.append(wgs_geom)
+
+        if not masks_metric:
+            raise QgsProcessingException(self.tr("No usable mask polygons."))
+
+        return _RoadSurface(
+            [],
+            masks_wgs,
+            0,
+            len(masks_wgs),
+            0,
+            progress,
+            interior_drop_m=interior_drop_m,
+            edge_blend_m=edge_blend_m,
+            masks_metric=masks_metric,
+            metric_crs=metric_crs,
+            lowering_only=True,
+            smooth_blend=smooth_blend,
         )
 
     @staticmethod
@@ -765,18 +990,31 @@ class _RoadSurface:
         mask_geoms_wgs,
         n_outline_used,
         n_masks,
-        interior_kept=0,
-        interior_skipped=0,
         n_ring_verts=0,
         progress=None,
+        interior_drop_m=0.0,
+        edge_blend_m=0.0,
+        masks_metric=None,
+        metric_crs=None,
+        lowering_only=False,
+        smooth_blend=True,
     ):
         self.triangles = triangles
         self.mask_geoms_wgs = mask_geoms_wgs
         self.n_outline_used = n_outline_used
         self.n_masks = n_masks
-        self.interior_kept = interior_kept
-        self.interior_skipped = interior_skipped
         self.n_ring_verts = n_ring_verts
+        self._interior_drop_m = max(float(interior_drop_m), 0.0)
+        self._edge_blend_m = max(float(edge_blend_m), 0.0)
+        self._lowering_only = bool(lowering_only)
+        self._smooth_blend = bool(smooth_blend)
+        self._to_metric = None
+        if metric_crs is not None and metric_crs.isValid():
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+            self._to_metric = QgsCoordinateTransform(
+                wgs84, metric_crs, QgsProject.instance()
+            )
+
         self._index = QgsSpatialIndex()
         self._by_id = {}
         n_tri = max(len(triangles), 1)
@@ -803,12 +1041,21 @@ class _RoadSurface:
 
         self._mask_index = QgsSpatialIndex()
         self._mask_by_id = {}
+        self._mask_rings = {}
+        self._mask_metric_rings = {}
+        metric_list = masks_metric or []
         n_masks_g = max(len(mask_geoms_wgs), 1)
         for i, g in enumerate(mask_geoms_wgs):
             feat = QgsFeature(i + 1)
-            feat.setGeometry(QgsGeometry(g))
+            # Rings used for fast per-vertex PIP; GEOS prepare is not available
+            # on all QGIS builds (QgsGeometry.prepareGeometry missing).
+            gg = QgsGeometry(g)
+            feat.setGeometry(gg)
             self._mask_index.addFeature(feat)
-            self._mask_by_id[i + 1] = g
+            self._mask_by_id[i + 1] = gg
+            self._mask_rings[i + 1] = _geom_rings_xy(gg)
+            if i < len(metric_list):
+                self._mask_metric_rings[i + 1] = _geom_rings_xy(metric_list[i])
             if progress is not None and (i % 100 == 0 or i + 1 == n_masks_g):
                 progress.tick(
                     i + 1,
@@ -822,6 +1069,12 @@ class _RoadSurface:
             es = max(t["bbox"][2] for t in triangles)
             ns = max(t["bbox"][3] for t in triangles)
             self._extent = (ws, ss, es, ns)
+        elif mask_geoms_wgs:
+            ws = min(g.boundingBox().xMinimum() for g in mask_geoms_wgs)
+            ss = min(g.boundingBox().yMinimum() for g in mask_geoms_wgs)
+            es = max(g.boundingBox().xMaximum() for g in mask_geoms_wgs)
+            ns = max(g.boundingBox().yMaximum() for g in mask_geoms_wgs)
+            self._extent = (ws, ss, es, ns)
         else:
             self._extent = None
 
@@ -831,21 +1084,65 @@ class _RoadSurface:
         ws, ss, es, ns = self._extent
         return not (east < ws or west > es or north < ss or south > ns)
 
-    def _inside_mask(self, lon, lat):
-        pt = QgsGeometry.fromPointXY(QgsPointXY(lon, lat))
-        for fid in self._mask_index.intersects(pt.boundingBox()):
+    def tile_hits_mask(self, west, south, east, north):
+        """True if this tile rectangle intersects any road mask."""
+        rect = QgsRectangle(west, south, east, north)
+        tile_geom = QgsGeometry.fromRect(rect)
+        for fid in self._mask_index.intersects(rect):
             g = self._mask_by_id.get(fid)
-            if g is not None and g.intersects(pt):
+            if g is not None and g.intersects(tile_geom):
                 return True
         return False
 
-    def sample_z(self, lon, lat):
-        if not self._inside_mask(lon, lat):
+    def _containing_mask_fid(self, lon, lat):
+        rect = QgsRectangle(lon, lat, lon, lat)
+        for fid in self._mask_index.intersects(rect):
+            rings = self._mask_rings.get(fid)
+            if rings and _point_in_rings(lon, lat, rings):
+                return fid
+        return None
+
+    def _blended_drop(self, lon, lat, mask_fid):
+        """
+        Drop amount at lon/lat.
+
+        Smooth (default): 0 at curb → full drop beyond edge strip (smoothstep).
+        Stair: 0 inside the outer strip, full drop deeper inside.
+        """
+        if self._interior_drop_m <= 0.0:
+            return 0.0
+        if self._edge_blend_m <= 0.0 or self._to_metric is None:
+            return self._interior_drop_m
+        rings = self._mask_metric_rings.get(mask_fid)
+        if not rings:
+            return self._interior_drop_m
+        mxy = self._to_metric.transform(QgsPointXY(lon, lat))
+        dist_m = _min_dist_to_rings(mxy.x(), mxy.y(), rings)
+        if self._smooth_blend:
+            t = max(0.0, min(1.0, dist_m / self._edge_blend_m))
+            t = t * t * (3.0 - 2.0 * t)
+            return self._interior_drop_m * t
+        # Stair: keep strip at TIN / current Z; full drop past strip.
+        if dist_m < self._edge_blend_m:
+            return 0.0
+        return self._interior_drop_m
+
+    def sample_z(self, lon, lat, current_z=None):
+        mask_fid = self._containing_mask_fid(lon, lat)
+        if mask_fid is None:
             return None
-        pt = QgsPointXY(lon, lat)
-        candidates = self._index.intersects(
-            QgsGeometry.fromPointXY(pt).boundingBox()
-        )
+        drop = self._blended_drop(lon, lat, mask_fid)
+        if self._lowering_only or not self.triangles:
+            if current_z is None:
+                return None
+            return float(current_z) - drop
+        z = self._tin_z(lon, lat)
+        if z is None:
+            return None
+        return z - drop
+
+    def _tin_z(self, lon, lat):
+        candidates = self._index.intersects(QgsRectangle(lon, lat, lon, lat))
         best = None
         best_d = None
         for fid in candidates:
@@ -915,111 +1212,183 @@ def _iter_polygon_rings_xy(metric_poly):
                     yield [(p.x(), p.y()) for p in ring]
 
 
-def _nearest_z(mx, my, samples):
-    if not samples:
-        return None
-    best_d = None
-    best_z = None
-    for sx, sy, _lon, _lat, z in samples:
-        d = (sx - mx) ** 2 + (sy - my) ** 2
-        if best_d is None or d < best_d:
-            best_d = d
-            best_z = z
-    return best_z
+def _geom_rings_xy(geom):
+    """All rings (exterior + holes) as (x, y) lists for even-odd PIP."""
+    return list(_iter_polygon_rings_xy(geom))
 
 
-def _drop_sagging_interiors(
-    samples,
-    masks_metric,
-    mask_boundaries,
-    mask_index,
-    outline_band_m,
-    proud_m,
-    feedback,
-):
+def _point_in_rings(x, y, rings):
+    """Even-odd point-in-polygon over one or more rings (holes flip)."""
+    inside = False
+    for ring in rings:
+        n = len(ring)
+        if n < 3:
+            continue
+        j = n - 1
+        for i in range(n):
+            xi, yi = ring[i]
+            xj, yj = ring[j]
+            if ((yi > y) != (yj > y)) and (
+                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-30) + xi
+            ):
+                inside = not inside
+            j = i
+    return inside
+
+
+def _point_segment_dist2(px, py, ax, ay, bx, by):
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    ab2 = abx * abx + aby * aby
+    if ab2 <= 1e-18:
+        dx = px - ax
+        dy = py - ay
+        return dx * dx + dy * dy
+    t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+    dx = px - (ax + t * abx)
+    dy = py - (ay + t * aby)
+    return dx * dx + dy * dy
+
+
+def _min_dist_to_rings(x, y, rings):
+    """Minimum Euclidean distance from point to any ring edge."""
+    best = None
+    for ring in rings:
+        n = len(ring)
+        if n < 2:
+            continue
+        # Rings from QGIS usually repeat the first vertex at the end.
+        limit = n - 1 if ring[0] == ring[-1] else n
+        for i in range(limit):
+            ax, ay = ring[i]
+            bx, by = ring[(i + 1) % n]
+            d2 = _point_segment_dist2(x, y, ax, ay, bx, by)
+            if best is None or d2 < best:
+                best = d2
+    if best is None:
+        return 0.0
+    return math.sqrt(best)
+
+
+def _fast_copy_tileset(src_root, dst_root, feedback, progress, tr):
     """
-    Mirror RoadPlacer DropSaggingInteriorSamples:
-    curb = on/near outline band OR outside mask; keep interiors only if
-    height >= interpolated curb Z + proud_m.
+    Copy a quantized-mesh tree as fast as practical.
+
+    Windows: multithreaded robocopy (many small .terrain files).
+    Fallback: shutil.copytree with copyfile (no metadata).
     """
-    curb = []
-    interior = []
-    for s in samples:
-        if feedback.isCanceled():
-            break
-        mx, my, lon, lat, z = s
-        pt = QgsGeometry.fromPointXY(QgsPointXY(mx, my))
-        inside = False
-        on_curb = False
-        for fid in mask_index.intersects(pt.boundingBox()):
-            gi = fid - 1
-            if gi < 0 or gi >= len(masks_metric):
-                continue
-            if masks_metric[gi].intersects(pt):
-                inside = True
-                if mask_boundaries[gi].distance(pt) <= outline_band_m:
-                    on_curb = True
-                break
-            if mask_boundaries[gi].distance(pt) <= outline_band_m:
-                on_curb = True
-        if on_curb or not inside:
-            curb.append(s)
-        else:
-            interior.append(s)
+    progress.tick(0, 1, "copying tileset…")
+    if feedback.isCanceled():
+        raise QgsProcessingException(tr("Canceled during copy."))
 
-    if not interior:
-        return curb, 0, 0
-    if not curb:
-        return samples, len(interior), 0
+    if os.name == "nt":
+        # /MT: parallel copy; quiet flags; /E = subdirs including empty.
+        # Robocopy exit codes 0–7 are success (bit flags); >= 8 is failure.
+        cmd = [
+            "robocopy",
+            src_root,
+            dst_root,
+            "/E",
+            "/MT:16",
+            "/R:1",
+            "/W:1",
+            "/NFL",
+            "/NDL",
+            "/NJH",
+            "/NJS",
+            "/NC",
+            "/NS",
+            "/NP",
+        ]
+        progress.tick(0, 1, "robocopy /MT:16…")
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode < 8:
+                feedback.pushInfo(
+                    tr(
+                        f"Tileset copy via robocopy "
+                        f"(exit {completed.returncode})."
+                    )
+                )
+                progress.tick(1, 1, "copy done")
+                return
+            feedback.pushWarning(
+                tr(
+                    f"robocopy failed (exit {completed.returncode}); "
+                    "falling back to Python copytree."
+                )
+            )
+        except OSError as exc:
+            feedback.pushWarning(
+                tr(f"robocopy unavailable ({exc}); using Python copytree.")
+            )
 
-    # Grid of curb samples for nearest search (metric meters).
-    cell = max(outline_band_m, 2.0)
+    progress.tick(0, 1, "copytree…")
+    # dirs_exist_ok: destination may already be an empty folder we created.
+    shutil.copytree(
+        src_root,
+        dst_root,
+        dirs_exist_ok=True,
+        copy_function=shutil.copyfile,
+    )
+    if feedback.isCanceled():
+        raise QgsProcessingException(tr("Canceled during copy."))
+    progress.tick(1, 1, "copy done")
+
+
+def _build_nearest_z_grid(samples, cell):
+    """Spatial hash for fast nearest-Z lookups (metric XY)."""
+    cell = max(float(cell), 1.0)
     grid = {}
-    for i, (mx, my, _lo, _la, _z) in enumerate(curb):
+    for i, (mx, my, _lon, _lat, _z) in enumerate(samples):
         key = (int(math.floor(mx / cell)), int(math.floor(my / cell)))
         grid.setdefault(key, []).append(i)
+    return grid, cell
 
-    def curb_z_at(mx, my):
-        cx = int(math.floor(mx / cell))
-        cy = int(math.floor(my / cell))
-        hits = []
-        for r in range(0, 21):
-            if len(hits) >= 8:
-                break
-            for dy in range(-r, r + 1):
-                for dx in range(-r, r + 1):
-                    if r > 0 and abs(dx) != r and abs(dy) != r:
-                        continue
-                    for ki in grid.get((cx + dx, cy + dy), []):
-                        kx, ky, _lon, _lat, kz = curb[ki]
-                        d2 = (mx - kx) ** 2 + (my - ky) ** 2
-                        hits.append((d2, kz))
-            if hits:
-                break
-        if not hits:
-            return curb[0][4]
-        hits.sort(key=lambda t: t[0])
-        use = hits[:6]
-        wsum = 0.0
-        zsum = 0.0
-        for d2, kz in use:
-            w = 1.0 / max(d2, 1.0e-6)
-            wsum += w
-            zsum += w * kz
-        return zsum / wsum if wsum > 0 else use[0][1]
 
-    kept_interior = 0
-    skipped = 0
-    out = list(curb)
-    for s in interior:
-        mx, my, lon, lat, z = s
-        cz = curb_z_at(mx, my)
-        if z + 1.0e-6 >= cz + proud_m:
-            out.append(s)
-            kept_interior += 1
-        else:
-            skipped += 1
-    return out, kept_interior, skipped
+def _nearest_z(mx, my, samples, grid=None, cell=None):
+    if not samples:
+        return None
+    if grid is None or cell is None:
+        best_d = None
+        best_z = None
+        for sx, sy, _lon, _lat, z in samples:
+            d = (sx - mx) ** 2 + (sy - my) ** 2
+            if best_d is None or d < best_d:
+                best_d = d
+                best_z = z
+        return best_z
+
+    cx = int(math.floor(mx / cell))
+    cy = int(math.floor(my / cell))
+    best_d = None
+    best_z = None
+    for r in range(0, 64):
+        found = False
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if r > 0 and abs(dx) != r and abs(dy) != r:
+                    continue
+                for i in grid.get((cx + dx, cy + dy), []):
+                    sx, sy, _lon, _lat, z = samples[i]
+                    d = (sx - mx) ** 2 + (sy - my) ** 2
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best_z = z
+                        found = True
+        if found:
+            break
+    if best_z is not None:
+        return best_z
+    # Fallback: rare empty-grid case.
+    return _nearest_z(mx, my, samples)
 
 
 def _barycentric(px, py, ax, ay, bx, by, cx, cy):
@@ -1051,24 +1420,170 @@ def _barycentric_clamped(px, py, ax, ay, bx, by, cx, cy):
     return w1 / s, w2 / s, w3 / s
 
 
-def _delaunay_simplices(points_xy):
-    """Return list of (i,j,k) vertex index triples."""
+def _thin_samples_metric(samples, cell_m=2.0):
+    """Keep one sample per metric grid cell (faster Delaunay on dense outlines)."""
+    cell_m = max(float(cell_m), 0.1)
+    best = {}
+    for s in samples:
+        key = (int(math.floor(s[0] / cell_m)), int(math.floor(s[1] / cell_m)))
+        if key not in best:
+            best[key] = s
+    return list(best.values())
+
+
+_DELAUNAY_BACKEND_LOGGED = False
+
+
+def _delaunay_simplices(points_xy, feedback=None):
+    """
+    Return list of (i,j,k) vertex index triples.
+
+    Prefers SciPy, then QGIS native/qgis Delaunay, then a tiny pure-Python
+    fallback only for small point sets.
+    """
+    global _DELAUNAY_BACKEND_LOGGED
+    n = len(points_xy)
+    if n < 3:
+        return []
+
+    def _log(msg):
+        global _DELAUNAY_BACKEND_LOGGED
+        if feedback is not None and not _DELAUNAY_BACKEND_LOGGED:
+            feedback.pushInfo(msg)
+            _DELAUNAY_BACKEND_LOGGED = True
+
     try:
         import numpy as np
         from scipy.spatial import Delaunay
 
         arr = np.asarray(points_xy, dtype=float)
-        if arr.shape[0] < 3:
-            return []
         tri = Delaunay(arr)
+        _log(f"Delaunay backend: SciPy ({n} points).")
         return [tuple(map(int, s)) for s in tri.simplices]
-    except Exception:
-        pass
+    except Exception as exc:
+        if feedback is not None and not _DELAUNAY_BACKEND_LOGGED:
+            feedback.pushInfo(
+                f"SciPy Delaunay unavailable ({exc}); trying QGIS Delaunay."
+            )
+
+    try:
+        simplices = _delaunay_simplices_qgis(points_xy)
+        if simplices:
+            _log(f"Delaunay backend: QGIS processing ({n} points).")
+            return simplices
+    except Exception as exc:
+        if feedback is not None:
+            feedback.pushWarning(f"QGIS Delaunay failed: {exc}")
+
+    if n > 800:
+        if feedback is not None:
+            feedback.pushWarning(
+                f"No fast Delaunay backend for {n} points. "
+                "Install SciPy into QGIS Python, or expect a very slow run. "
+                "Skipping this mask's triangulation."
+            )
+        return []
+
+    _log(f"Delaunay backend: pure-Python fallback ({n} points).")
     return _delaunay_simplices_bowyer(points_xy)
 
 
+def _delaunay_simplices_qgis(points_xy):
+    """Fast Delaunay via QGIS Processing (no SciPy required)."""
+    import processing
+    from qgis.PyQt.QtCore import QVariant
+    from qgis.core import QgsField, QgsFields, QgsVectorLayer
+
+    layer = QgsVectorLayer("Point?crs=EPSG:3857", "road_delaunay_in", "memory")
+    if not layer.isValid():
+        raise RuntimeError("Could not create memory point layer.")
+    fields = QgsFields()
+    fields.append(QgsField("sid", QVariant.Int))
+    prov = layer.dataProvider()
+    prov.addAttributes(fields)
+    layer.updateFields()
+
+    key_to_i = {}
+    feats = []
+    for i, (x, y) in enumerate(points_xy):
+        f = QgsFeature(layer.fields())
+        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(float(x), float(y))))
+        f.setAttributes([i])
+        feats.append(f)
+        key_to_i[(round(float(x), 4), round(float(y), 4))] = i
+    prov.addFeatures(feats)
+    layer.updateExtents()
+
+    result = None
+    last_err = None
+    for alg_id in (
+        "native:delaunaytriangulation",
+        "qgis:delaunaytriangulation",
+    ):
+        try:
+            result = processing.run(
+                alg_id,
+                {"INPUT": layer, "OUTPUT": "memory:"},
+            )
+            break
+        except Exception as exc:
+            last_err = exc
+            result = None
+    if result is None:
+        raise RuntimeError(f"Delaunay algorithm failed: {last_err}")
+
+    out = result.get("OUTPUT")
+    if out is None:
+        raise RuntimeError("Delaunay produced no output layer.")
+
+    def lookup(x, y):
+        key = (round(float(x), 4), round(float(y), 4))
+        idx = key_to_i.get(key)
+        if idx is not None:
+            return idx
+        # Rare numeric drift: nearest input.
+        best_i = 0
+        best_d = None
+        for i, (px, py) in enumerate(points_xy):
+            d = (px - x) ** 2 + (py - y) ** 2
+            if best_d is None or d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
+    simplices = []
+    for feat in out.getFeatures():
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        ring = None
+        flat = QgsWkbTypes.flatType(geom.wkbType())
+        if flat == QgsWkbTypes.Polygon:
+            poly = geom.asPolygon()
+            if poly:
+                ring = poly[0]
+        elif flat == QgsWkbTypes.MultiPolygon:
+            multi = geom.asMultiPolygon()
+            if multi and multi[0]:
+                ring = multi[0][0]
+        if not ring or len(ring) < 3:
+            continue
+        pts = ring[:-1] if (
+            abs(ring[0].x() - ring[-1].x()) < 1e-9
+            and abs(ring[0].y() - ring[-1].y()) < 1e-9
+        ) else ring
+        if len(pts) < 3:
+            continue
+        ia = lookup(pts[0].x(), pts[0].y())
+        ib = lookup(pts[1].x(), pts[1].y())
+        ic = lookup(pts[2].x(), pts[2].y())
+        if len({ia, ib, ic}) == 3:
+            simplices.append((ia, ib, ic))
+    return simplices
+
+
 def _delaunay_simplices_bowyer(points_xy):
-    """Small pure-Python Bowyer–Watson fallback when SciPy is unavailable."""
+    """Small pure-Python Bowyer–Watson fallback for tiny point sets only."""
     pts = [(float(x), float(y)) for x, y in points_xy]
     n = len(pts)
     if n < 3:

@@ -184,10 +184,12 @@ class QuantizedMeshTile:
         return best_alt
 
 
-def load_tile(path: Path, level: int, x: int, y: int) -> QuantizedMeshTile:
-    data = _read_tile_bytes(path)
+def load_tile_from_bytes(
+    data: bytes, level: int, x: int, y: int
+) -> QuantizedMeshTile:
+    """Parse an uncompressed quantized-mesh buffer into lon/lat/altitude arrays."""
     if len(data) < HEADER_BYTES + 4:
-        raise ValueError(f"Tile too small: {path}")
+        raise ValueError("Tile too small")
 
     # Cesium header MinimumHeight / MaximumHeight (meters)
     min_alt, max_alt = struct.unpack_from("<ff", data, 24)
@@ -245,6 +247,14 @@ def load_tile(path: Path, level: int, x: int, y: int) -> QuantizedMeshTile:
     return QuantizedMeshTile(
         lons, lats, altitudes, triangles, (west, south, east, north)
     )
+
+
+def load_tile(path: Path, level: int, x: int, y: int) -> QuantizedMeshTile:
+    data = _read_tile_bytes(path)
+    try:
+        return load_tile_from_bytes(data, level, x, y)
+    except ValueError as exc:
+        raise ValueError(f"{exc}: {path}") from exc
 
 
 class QuantizedMeshSampler:
@@ -397,20 +407,21 @@ def load_tile_altitudes_lonlat(
     path: Path, level: int, x: int, y: int
 ) -> Tuple[bytes, bool, List[float], List[float], List[float]]:
     """
-    Load a tile.
+    Load a tile once.
 
     Returns (raw_uncompressed, was_gzip, lons, lats, altitudes).
     """
     raw = path.read_bytes()
     was_gzip = raw[:2] == b"\x1f\x8b"
     data = gzip.decompress(raw) if was_gzip else raw
-    tile = load_tile(path, level, x, y)
-    return data, was_gzip, tile.lons, tile.lats, list(tile.altitudes)
+    tile = load_tile_from_bytes(data, level, x, y)
+    return data, was_gzip, tile.lons, tile.lats, tile.altitudes
 
 
 def write_terrain_file(path: Path, data: bytes, use_gzip: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if use_gzip:
-        path.write_bytes(gzip.compress(data, compresslevel=6))
+        # Level 1 is much faster than default 6; terrain is already delta-coded.
+        path.write_bytes(gzip.compress(data, compresslevel=1))
     else:
         path.write_bytes(data)

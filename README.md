@@ -106,10 +106,11 @@ Folder: [`scripts/mesh_flatten/`](scripts/mesh_flatten/)
 
 **Run after** generating outline PointZ (mask-points tool, centers off). Copies the input tileset to a new folder (never overwrites). Sample selection and TIN rules match **Unreal RoadPlacer**:
 
-- PointZ on/near mask (**15 m** snap default) or inside mask
-- Drop sagging interiors (1.5 m curb band; optional proud threshold)
+- Outline/curb PointZ on/near mask (**15 m** snap default) or inside mask (`point_role=center` skipped)
 - Inject mask ring vertices with nearest PointZ height
 - 2D Delaunay; keep triangles whose centroid is inside the mask; set mesh vertices inside the mask to that linear Z
+- Optional **Lower interior**: drop terrain under masks; **Smooth edge blend** on (default) or off for a stair step; strip/blend width + max drop
+- Optional **Interior lowering only**: skip TIN flatten; input an already-flattened mesh and only apply the drop (outline points not required)
 
 Processes **all** `.terrain` tiles under the folder (`{x}/{y}` and `{level}/{x}/{y}`).
 
@@ -117,7 +118,8 @@ Processes **all** `.terrain` tiles under the folder (`{x}/{y}` and `{level}/{x}/
 
 1. Add `scripts/mesh_flatten/flatten_road_mesh.py` to the toolbox (keep `quantized_mesh.py` available)
 2. Run **QGIS Projects → Flatten road masks in quantized mesh**
-3. Inputs: road masks, outline points + altitude field, input mesh folder, empty/new output folder, near-mask snap (default **15 m**), interior proud (default **0**)
+3. Full flatten: road masks, outline points + altitude field, input mesh, empty output folder
+4. Lowering only: enable **Interior lowering only**, set input to your previous flatten output, masks + blend/drop meters (no outline points)
 
 ## Line-of-Sight checker
 
