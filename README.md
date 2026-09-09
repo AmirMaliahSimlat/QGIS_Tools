@@ -5,6 +5,8 @@ Small QGIS Processing tools for GIS workflows.
 ```text
 scripts/
   quantized_mesh.py      # shared Cesium quantized-mesh reader
+  parallel_util.py       # process-pool helpers
+  mesh_flatten_workers.py# picklable flatten tile workers
   building_altitude/     # Building altitude + random height
   water_altitude/        # Water median altitude from mesh
   mask_points/           # Polygon mask → outline (+ optional legacy centers)
@@ -14,7 +16,17 @@ scripts/
   roof_type/             # Assign roof_type from zone polygons
 ```
 
-When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) available (same `scripts/` parent, or copy it next to the algorithm if QGIS isolates scripts).
+When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) (and for flatten: `parallel_util.py`, `mesh_flatten_workers.py`) available under the same `scripts/` parent.
+
+### Worker processes
+
+Several mesh-heavy tools accept **Worker processes**: `0` = auto (up to 8 cores), `1` = serial. Applies to mesh altitude sampling / tile patching on:
+
+- Flatten road masks in quantized mesh
+- Tree mask polygons to spaced points (altitude phase)
+- Polygon mask points with altitude
+- Building altitude and random height
+- Water median quantized-mesh altitude
 
 ## Building altitude and random height
 
@@ -116,10 +128,11 @@ Processes **all** `.terrain` tiles under the folder (`{x}/{y}` and `{level}/{x}/
 
 ### Install / run in QGIS
 
-1. Add `scripts/mesh_flatten/flatten_road_mesh.py` to the toolbox (keep `quantized_mesh.py` available)
+1. Add `scripts/mesh_flatten/flatten_road_mesh.py` to the toolbox (keep `quantized_mesh.py`, `parallel_util.py`, and `mesh_flatten_workers.py` available)
 2. Run **QGIS Projects → Flatten road masks in quantized mesh**
 3. Full flatten: road masks, outline points + altitude field, input mesh, empty output folder
 4. Lowering only: enable **Interior lowering only**, set input to your previous flatten output, masks + blend/drop meters (no outline points)
+5. Optional **Worker processes** (`0`=auto) speeds tile patching on multi-core PCs
 
 ## Line-of-Sight checker
 

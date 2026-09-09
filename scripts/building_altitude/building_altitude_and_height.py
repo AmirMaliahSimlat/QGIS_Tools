@@ -40,7 +40,10 @@ for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quantized_mesh import QuantizedMeshSampler  # noqa: E402
+from quantized_mesh import (  # noqa: E402
+    QuantizedMeshSampler,
+    sample_lonlats_parallel,
+)
 
 ALTITUDE_FIELD = "altitude"
 MAX_ALTITUDE_FIELD = "max_altitude"
@@ -53,6 +56,7 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
     MIN_VALUE = "MIN_VALUE"
     MAX_VALUE = "MAX_VALUE"
     SEED = "SEED"
+    WORKERS = "WORKERS"
     OUTPUT = "OUTPUT"
 
     def tr(self, string):
@@ -128,6 +132,17 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            QgsProcessingParameterNumber(
+                self.WORKERS,
+                self.tr(
+                    "Worker processes (0=auto, 1=serial)"
+                ),
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=0,
+                minValue=0,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
                 self.tr("Buildings with altitude and height"),
@@ -142,6 +157,7 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
         min_v = self.parameterAsDouble(parameters, self.MIN_VALUE, context)
         max_v = self.parameterAsDouble(parameters, self.MAX_VALUE, context)
         seed = self.parameterAsInt(parameters, self.SEED, context)
+        workers_req = self.parameterAsInt(parameters, self.WORKERS, context)
 
         if buildings is None:
             raise QgsProcessingException(self.tr("Invalid buildings layer."))
@@ -208,17 +224,54 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
         filled = 0
         nulls = 0
 
-        for current, feature in enumerate(buildings.getFeatures()):
+        # Collect WGS84 sample coords per feature, then mesh-sample in parallel.
+        feats = list(buildings.getFeatures())
+        feat_sample_counts = []
+        lonlats = []
+        for feature in feats:
             if feedback.isCanceled():
                 break
+            pts = self._exterior_sample_lonlats(feature.geometry(), transform)
+            feat_sample_counts.append(len(pts))
+            lonlats.extend(pts)
+
+        alts = sample_lonlats_parallel(
+            mesh_folder,
+            lonlats,
+            workers=workers_req,
+            level=sampler.level,
+            feedback=feedback,
+            scripts_root=_SCRIPTS_ROOT,
+        )
+
+        offset = 0
+        for current, feature in enumerate(feats):
+            if feedback.isCanceled():
+                break
+            n = feat_sample_counts[current] if current < len(feat_sample_counts) else 0
+            chunk = alts[offset : offset + n]
+            offset += n
 
             out_feature = QgsFeature(fields)
             out_feature.setGeometry(feature.geometry())
             attrs = list(feature.attributes())
 
-            min_z, max_z = self._exterior_altitude_range(
-                feature.geometry(), sampler, transform
-            )
+            min_z = None
+            max_z = None
+            for alt in chunk:
+                if alt is None:
+                    continue
+                try:
+                    z = float(alt)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(z):
+                    continue
+                if min_z is None or z < min_z:
+                    min_z = z
+                if max_z is None or z > max_z:
+                    max_z = z
+
             if (
                 min_z is not None
                 and max_z is not None
@@ -243,6 +296,32 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
             )
         )
         return {self.OUTPUT: dest_id}
+
+    def _exterior_sample_lonlats(self, geometry, transform):
+        """WGS84 (lon, lat) samples: exterior vertices + edge midpoints."""
+        pts = []
+        if geometry is None or geometry.isEmpty():
+            return pts
+        for exterior in self._exterior_rings(geometry):
+            if not exterior:
+                continue
+            n = len(exterior)
+            for i in range(n):
+                x, y = exterior[i][0], exterior[i][1]
+                if transform is not None:
+                    p = transform.transform(x, y)
+                    x, y = p.x(), p.y()
+                pts.append((x, y))
+                if i + 1 >= n:
+                    continue
+                x1, y1 = exterior[i][0], exterior[i][1]
+                x2, y2 = exterior[i + 1][0], exterior[i + 1][1]
+                mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+                if transform is not None:
+                    p = transform.transform(mx, my)
+                    mx, my = p.x(), p.y()
+                pts.append((mx, my))
+        return pts
 
     def _exterior_altitude_range(self, geometry, sampler, transform):
         """(min, max) valid mesh samples on exterior rings, or (None, None)."""

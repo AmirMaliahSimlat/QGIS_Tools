@@ -425,3 +425,78 @@ def write_terrain_file(path: Path, data: bytes, use_gzip: bool) -> None:
         path.write_bytes(gzip.compress(data, compresslevel=1))
     else:
         path.write_bytes(data)
+
+
+def sample_lonlats_batch(
+    mesh_folder: str,
+    lonlats: List[Tuple[float, float]],
+    level: Optional[int] = None,
+) -> List[Optional[float]]:
+    """Sample altitudes for a chunk of (lon, lat) points (one process)."""
+    sampler = QuantizedMeshSampler(Path(mesh_folder), level=level)
+    out: List[Optional[float]] = []
+    for lon, lat in lonlats:
+        try:
+            out.append(sampler.sample(float(lon), float(lat)))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _sample_lonlats_chunk(
+    args: Tuple[str, List[Tuple[float, float]], Optional[int]]
+) -> List[Optional[float]]:
+    folder, lonlats, level = args
+    return sample_lonlats_batch(folder, lonlats, level=level)
+
+
+def sample_lonlats_parallel(
+    mesh_folder: str,
+    lonlats: List[Tuple[float, float]],
+    workers: int = 0,
+    level: Optional[int] = None,
+    feedback=None,
+    scripts_root: Optional[str] = None,
+) -> List[Optional[float]]:
+    """
+    Sample mesh altitudes for many WGS84 points.
+
+    ``workers``: 0 = auto, 1 = serial. Returns one altitude (or None) per input.
+    """
+    from parallel_util import map_in_processes, resolve_workers
+
+    if not lonlats:
+        return []
+
+    n_workers = resolve_workers(workers)
+    if n_workers == 1 or len(lonlats) < 64:
+        if feedback is not None and hasattr(feedback, "pushInfo"):
+            feedback.pushInfo(f"Using 1 worker process (mesh sample).")
+        return sample_lonlats_batch(mesh_folder, lonlats, level=level)
+
+    # Chunk by worker count (aim ~equal sizes, min 32 pts/chunk).
+    n = len(lonlats)
+    chunk_size = max(32, (n + n_workers - 1) // n_workers)
+    chunks: List[List[Tuple[float, float]]] = [
+        lonlats[i : i + chunk_size] for i in range(0, n, chunk_size)
+    ]
+    tasks = [(mesh_folder, ch, level) for ch in chunks]
+    if feedback is not None and hasattr(feedback, "pushInfo"):
+        feedback.pushInfo(
+            f"Using {n_workers} worker processes "
+            f"({len(chunks)} mesh-sample chunks)."
+        )
+    parts = map_in_processes(
+        _sample_lonlats_chunk,
+        tasks,
+        workers=n_workers,
+        scripts_root=scripts_root,
+        feedback=feedback,
+        progress_label="Mesh altitude samples",
+    )
+    out: List[Optional[float]] = []
+    for part in parts:
+        if part:
+            out.extend(part)
+    return out
+

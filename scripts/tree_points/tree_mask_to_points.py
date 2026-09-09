@@ -41,7 +41,10 @@ for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quantized_mesh import QuantizedMeshSampler  # noqa: E402
+from quantized_mesh import (  # noqa: E402
+    QuantizedMeshSampler,
+    sample_lonlats_parallel,
+)
 
 ALTITUDE_FIELD = "altitude"
 
@@ -52,6 +55,7 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_MESH = "INPUT_MESH"
     MIN_DISTANCE = "MIN_DISTANCE"
     BUILDING_CLEARANCE = "BUILDING_CLEARANCE"
+    WORKERS = "WORKERS"
     OUTPUT = "OUTPUT"
 
     def tr(self, string):
@@ -128,6 +132,17 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            QgsProcessingParameterNumber(
+                self.WORKERS,
+                self.tr(
+                    "Worker processes (0=auto, 1=serial)"
+                ),
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=0,
+                minValue=0,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
                 self.tr("Spaced tree points"),
@@ -148,6 +163,7 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         clearance = self.parameterAsDouble(
             parameters, self.BUILDING_CLEARANCE, context
         )
+        workers_req = self.parameterAsInt(parameters, self.WORKERS, context)
 
         if layer is None:
             raise QgsProcessingException(self.tr("Invalid polygon layer."))
@@ -378,35 +394,44 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             self.tr(f"Sampling altitudes (0/{total_out})…")
         )
 
-        written = 0
-        null_alt = 0
-        denom = max(total_out, 1)
-        for k, mpt in enumerate(accepted_metric):
+        # Transform once in parent; mesh samples in worker processes.
+        records = []  # (src_x, src_y, lon, lat)
+        lonlats = []
+        for mpt in accepted_metric:
             if feedback.isCanceled():
                 break
-            if k % 100 == 0 or k + 1 == total_out:
-                feedback.setProgress(65 + int(35.0 * k / denom))
-                feedback.setProgressText(
-                    self.tr(
-                        f"Sampling altitudes… {k + 1}/{total_out}"
-                    )
-                )
-
             src_pt = to_source.transform(QgsPointXY(mpt[0], mpt[1]))
             wgs = to_wgs84.transform(src_pt)
-            alt = sampler.sample(wgs.x(), wgs.y())
+            records.append((src_pt.x(), src_pt.y(), wgs.x(), wgs.y()))
+            lonlats.append((wgs.x(), wgs.y()))
+
+        alts = sample_lonlats_parallel(
+            mesh_folder,
+            lonlats,
+            workers=workers_req,
+            level=sampler.level,
+            feedback=feedback,
+            scripts_root=_SCRIPTS_ROOT,
+        )
+
+        written = 0
+        null_alt = 0
+        for (sx, sy, _lo, _la), alt in zip(records, alts):
+            if feedback.isCanceled():
+                break
             try:
                 alt_f = float(alt) if alt is not None else None
             except (TypeError, ValueError):
                 alt_f = None
-            if alt_f is None:
+            if alt_f is None or not math.isfinite(alt_f):
                 null_alt += 1
                 z = 0.0
+                alt_f = None
             else:
                 z = alt_f
 
             out = QgsFeature(fields)
-            out.setGeometry(QgsGeometry(QgsPoint(src_pt.x(), src_pt.y(), z)))
+            out.setGeometry(QgsGeometry(QgsPoint(sx, sy, z)))
             out.setAttributes([alt_f])
             sink.addFeature(out, QgsFeatureSink.FastInsert)
             written += 1

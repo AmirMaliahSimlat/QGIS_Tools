@@ -106,6 +106,7 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
     INTERIOR_DROP = "INTERIOR_DROP"
     LOWERING_ONLY = "LOWERING_ONLY"
     SMOOTH_BLEND = "SMOOTH_BLEND"
+    WORKERS = "WORKERS"
 
     def tr(self, string):
         return QCoreApplication.translate("Processing", string)
@@ -250,6 +251,17 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                 minValue=0.0,
             )
         )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.WORKERS,
+                self.tr(
+                    "Worker processes (0=auto, 1=serial)"
+                ),
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=0,
+                minValue=0,
+            )
+        )
 
     def processAlgorithm(self, parameters, context, feedback):
         masks_layer = self.parameterAsVectorLayer(
@@ -280,6 +292,9 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         )
         smooth_blend = self.parameterAsBool(
             parameters, self.SMOOTH_BLEND, context
+        )
+        workers_req = self.parameterAsInt(
+            parameters, self.WORKERS, context
         )
 
         if masks_layer is None:
@@ -404,90 +419,100 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
         tiles = discover_terrain_tiles(out_path)
         feedback.pushInfo(self.tr(f"Found {len(tiles)} .terrain tiles."))
 
-        changed_tiles = 0
-        changed_verts = 0
-        examined = 0
+        from parallel_util import resolve_workers
+        from mesh_flatten_workers import (
+            init_tile_worker,
+            patch_one_tile,
+            snapshot_from_road_surface,
+        )
+
+        n_workers = resolve_workers(workers_req)
+        feedback.pushInfo(
+            self.tr(f"Using {n_workers} worker process(es) for tile patch.")
+        )
+
+        # Parent: cheap bbox / mask skips, then farm remaining tiles.
+        work = []
         skipped_bbox = 0
         skipped_mask = 0
-        n_tiles = max(len(tiles), 1)
-        for ti, (tile_path, level, tx, ty) in enumerate(tiles):
+        for tile_path, level, tx, ty in tiles:
             if feedback.isCanceled():
                 break
-
-            # Always advance the bar, including fast bbox skips.
-            if ti % 25 == 0 or ti + 1 == n_tiles:
-                rel = os.path.relpath(str(tile_path), out_path)
-                progress.tick(
-                    ti + 1,
-                    n_tiles,
-                    (
-                        f"tile {ti + 1}/{n_tiles} LOD {level} "
-                        f"examined={examined} patched={changed_tiles} "
-                        f"verts={changed_verts} skip_bbox={skipped_bbox} "
-                        f"skip_mask={skipped_mask} | {rel}"
-                    ),
-                )
-
             west, south, east, north = _tile_bounds_deg(level, tx, ty)
             if not surface.bounds_intersect(west, south, east, north):
                 skipped_bbox += 1
                 continue
-            # Overall road extent can be huge; skip tiles that miss every mask.
             if not surface.tile_hits_mask(west, south, east, north):
                 skipped_mask += 1
                 continue
+            work.append((str(tile_path), int(level), int(tx), int(ty)))
 
-            examined += 1
-            try:
-                data, was_gzip, lons, lats, alts = load_tile_altitudes_lonlat(
-                    tile_path, level, tx, ty
-                )
-            except Exception as exc:
-                feedback.pushWarning(
-                    self.tr(f"Skip unreadable tile {tile_path}: {exc}")
-                )
-                continue
+        examined = len(work)
+        changed_tiles = 0
+        changed_verts = 0
+        snap_data = snapshot_from_road_surface(
+            surface,
+            utm_zone=getattr(surface, "_utm_zone", 14),
+            utm_northern=getattr(surface, "_utm_northern", True),
+        )
 
-            modified = False
-            new_alts = list(alts)
-            n_verts = len(alts)
-            for vi, (lon, lat, old_z) in enumerate(zip(lons, lats, alts)):
+        if n_workers == 1 or len(work) <= 1:
+            init_tile_worker(_SCRIPTS_ROOT, snap_data)
+            n_work = max(len(work), 1)
+            for ti, task in enumerate(work):
                 if feedback.isCanceled():
                     break
-                # Extra detail on heavy tiles so long vertex loops don't look stuck.
-                if n_verts >= 4000 and (
-                    vi % 2000 == 0 or vi + 1 == n_verts
-                ):
+                if ti % 25 == 0 or ti + 1 == len(work):
                     progress.tick(
-                        ti + (vi + 1) / max(n_verts, 1),
-                        n_tiles,
+                        ti + 1,
+                        n_work,
                         (
-                            f"tile {ti + 1}/{n_tiles} LOD {level} "
-                            f"vertices {vi + 1}/{n_verts} "
+                            f"tile {ti + 1}/{len(work)} "
                             f"patched={changed_tiles} verts={changed_verts}"
                         ),
                     )
-                new_z = surface.sample_z(lon, lat, current_z=old_z)
-                if new_z is None:
-                    continue
-                if abs(new_z - old_z) > 1e-6:
-                    new_alts[vi] = new_z
-                    modified = True
-                    changed_verts += 1
+                changed, nverts, err = patch_one_tile(task)
+                if err:
+                    feedback.pushWarning(self.tr(err))
+                if changed:
+                    changed_tiles += 1
+                    changed_verts += nverts
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
 
-            if not modified:
-                continue
-
-            try:
-                patched = replace_tile_altitudes(
-                    data, level, tx, ty, new_alts
-                )
-                write_terrain_file(tile_path, patched, was_gzip)
-                changed_tiles += 1
-            except Exception as exc:
-                feedback.pushWarning(
-                    self.tr(f"Failed writing {tile_path}: {exc}")
-                )
+            n_work = max(len(work), 1)
+            progress.tick(0, n_work, f"0/{len(work)} tiles")
+            with ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=init_tile_worker,
+                initargs=(_SCRIPTS_ROOT, snap_data),
+            ) as pool:
+                futures = {
+                    pool.submit(patch_one_tile, task): task for task in work
+                }
+                done = 0
+                for fut in as_completed(futures):
+                    if feedback.isCanceled():
+                        for f in futures:
+                            f.cancel()
+                        break
+                    changed, nverts, err = fut.result()
+                    done += 1
+                    if err:
+                        feedback.pushWarning(self.tr(err))
+                    if changed:
+                        changed_tiles += 1
+                        changed_verts += nverts
+                    if done % 10 == 0 or done == len(work):
+                        progress.tick(
+                            done,
+                            n_work,
+                            (
+                                f"tile {done}/{len(work)} "
+                                f"patched={changed_tiles} "
+                                f"verts={changed_verts}"
+                            ),
+                        )
 
         feedback.setProgress(100)
         feedback.setProgressText(self.tr("Finished"))
@@ -1008,6 +1033,21 @@ class _RoadSurface:
         self._edge_blend_m = max(float(edge_blend_m), 0.0)
         self._lowering_only = bool(lowering_only)
         self._smooth_blend = bool(smooth_blend)
+        self._utm_zone = 14
+        self._utm_northern = True
+        if metric_crs is not None and metric_crs.isValid():
+            auth = metric_crs.authid() or ""
+            if auth.startswith("EPSG:"):
+                try:
+                    code = int(auth.split(":")[1])
+                    if 32601 <= code <= 32660:
+                        self._utm_zone = code - 32600
+                        self._utm_northern = True
+                    elif 32701 <= code <= 32760:
+                        self._utm_zone = code - 32700
+                        self._utm_northern = False
+                except ValueError:
+                    pass
         self._to_metric = None
         if metric_crs is not None and metric_crs.isValid():
             wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")

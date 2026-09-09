@@ -46,7 +46,10 @@ for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quantized_mesh import QuantizedMeshSampler  # noqa: E402
+from quantized_mesh import (  # noqa: E402
+    QuantizedMeshSampler,
+    sample_lonlats_parallel,
+)
 
 ALTITUDE_FIELD = "altitude"
 ROLE_FIELD = "point_role"
@@ -64,6 +67,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
     ADD_CENTER_POINTS = "ADD_CENTER_POINTS"
     CENTER_MODE = "CENTER_MODE"
     CENTER_GRID_SPACING = "CENTER_GRID_SPACING"
+    WORKERS = "WORKERS"
     OUTPUT = "OUTPUT"
 
     def tr(self, string):
@@ -150,6 +154,17 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            QgsProcessingParameterNumber(
+                self.WORKERS,
+                self.tr(
+                    "Worker processes (0=auto, 1=serial)"
+                ),
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=0,
+                minValue=0,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
                 self.tr("Mask points with altitude"),
@@ -171,6 +186,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         center_grid_spacing = self.parameterAsDouble(
             parameters, self.CENTER_GRID_SPACING, context
         )
+        workers_req = self.parameterAsInt(parameters, self.WORKERS, context)
 
         if layer is None:
             raise QgsProcessingException(self.tr("Invalid polygon layer."))
@@ -256,6 +272,8 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         null_alt = 0
         progress = _Progress(feedback, n_poly, self.tr)
 
+        # Collect (src_x, src_y, lon, lat, role) then mesh-sample in parallel.
+        pending = []
         for i, feature in enumerate(features):
             if feedback.isCanceled():
                 break
@@ -283,22 +301,12 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 for p_idx, (mx, my) in enumerate(densified):
                     if feedback.isCanceled():
                         break
-                    alt_f, z, ok = self._sample_metric_xy(
-                        mx, my, to_source, to_wgs84, sampler
-                    )
-                    if not ok:
-                        null_alt += 1
-                    out = QgsFeature(fields)
                     src_pt = to_source.transform(QgsPointXY(mx, my))
-                    out.setGeometry(
-                        QgsGeometry(QgsPoint(src_pt.x(), src_pt.y(), z))
+                    wgs = to_wgs84.transform(src_pt)
+                    pending.append(
+                        (src_pt.x(), src_pt.y(), wgs.x(), wgs.y(), ROLE_OUTLINE)
                     )
-                    out.setAttributes([alt_f, ROLE_OUTLINE])
-                    sink.addFeature(out, QgsFeatureSink.FastInsert)
-                    written_outline += 1
-
                     if p_idx % 100 == 0 or p_idx + 1 == n_pts:
-                        # Outline uses first half of this polygon's budget.
                         ring_frac = (r_idx + (p_idx + 1) / n_pts) / n_rings
                         outline_frac = 0.5 * ring_frac
                         progress.update(
@@ -306,8 +314,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                             (
                                 f"outline ring {r_idx + 1}/{n_rings}, "
                                 f"point {p_idx + 1}/{n_pts} "
-                                f"(outline={written_outline}, "
-                                f"center={written_center})"
+                                f"(queued={len(pending)})"
                             ),
                         )
 
@@ -328,8 +335,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                             (
                                 f"{label} part {part_idx + 1}/{n_parts}, "
                                 f"{done}/{max(total, 1)} "
-                                f"(outline={written_outline}, "
-                                f"center={written_center})"
+                                f"(queued={len(pending)})"
                             ),
                         )
 
@@ -354,17 +360,55 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                             _center_progress,
                         )
 
-                    for cx, cy, alt_f, z in centers:
-                        out = QgsFeature(fields)
+                    for cx, cy, _alt_f, _z in centers:
                         src_pt = to_source.transform(QgsPointXY(cx, cy))
-                        out.setGeometry(
-                            QgsGeometry(QgsPoint(src_pt.x(), src_pt.y(), z))
+                        wgs = to_wgs84.transform(src_pt)
+                        pending.append(
+                            (
+                                src_pt.x(),
+                                src_pt.y(),
+                                wgs.x(),
+                                wgs.y(),
+                                ROLE_CENTER,
+                            )
                         )
-                        out.setAttributes([alt_f, ROLE_CENTER])
-                        sink.addFeature(out, QgsFeatureSink.FastInsert)
-                        written_center += 1
 
-            progress.finish_polygon(written_outline, written_center, "done")
+            progress.finish_polygon(written_outline, written_center, "queued")
+
+        lonlats = [(p[2], p[3]) for p in pending]
+        feedback.pushInfo(
+            self.tr(f"Sampling altitudes for {len(lonlats)} points…")
+        )
+        alts = sample_lonlats_parallel(
+            mesh_folder,
+            lonlats,
+            workers=workers_req,
+            level=sampler.level,
+            feedback=feedback,
+            scripts_root=_SCRIPTS_ROOT,
+        )
+
+        for (sx, sy, _lo, _la, role), alt in zip(pending, alts):
+            if feedback.isCanceled():
+                break
+            try:
+                alt_f = float(alt) if alt is not None else None
+            except (TypeError, ValueError):
+                alt_f = None
+            if alt_f is None or not math.isfinite(alt_f):
+                null_alt += 1
+                z = 0.0
+                alt_f = None
+            else:
+                z = alt_f
+            out = QgsFeature(fields)
+            out.setGeometry(QgsGeometry(QgsPoint(sx, sy, z)))
+            out.setAttributes([alt_f, role])
+            sink.addFeature(out, QgsFeatureSink.FastInsert)
+            if role == ROLE_CENTER:
+                written_center += 1
+            else:
+                written_outline += 1
 
         feedback.setProgress(100)
         mode_note = ""

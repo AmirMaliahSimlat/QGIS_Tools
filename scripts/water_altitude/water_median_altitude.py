@@ -39,7 +39,10 @@ for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from quantized_mesh import QuantizedMeshSampler  # noqa: E402
+from quantized_mesh import (  # noqa: E402
+    QuantizedMeshSampler,
+    sample_lonlats_parallel,
+)
 
 ALTITUDE_FIELD = "altitude"
 
@@ -48,6 +51,7 @@ class WaterMedianAltitudeAlgorithm(QgsProcessingAlgorithm):
     INPUT_WATER = "INPUT_WATER"
     INPUT_MESH = "INPUT_MESH"
     INTERIOR_STEP = "INTERIOR_STEP"
+    WORKERS = "WORKERS"
     OUTPUT = "OUTPUT"
 
     def tr(self, string):
@@ -106,6 +110,17 @@ class WaterMedianAltitudeAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            QgsProcessingParameterNumber(
+                self.WORKERS,
+                self.tr(
+                    "Worker processes (0=auto, 1=serial)"
+                ),
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=0,
+                minValue=0,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
                 self.tr("Water with altitude"),
@@ -120,6 +135,7 @@ class WaterMedianAltitudeAlgorithm(QgsProcessingAlgorithm):
         interior_step = self.parameterAsDouble(
             parameters, self.INTERIOR_STEP, context
         )
+        workers_req = self.parameterAsInt(parameters, self.WORKERS, context)
 
         if water is None:
             raise QgsProcessingException(self.tr("Invalid water layer."))
@@ -189,22 +205,53 @@ class WaterMedianAltitudeAlgorithm(QgsProcessingAlgorithm):
         filled = 0
         nulls = 0
 
-        for current, feature in enumerate(water.getFeatures()):
+        feats = list(water.getFeatures())
+        feat_counts = []
+        lonlats = []
+        for feature in feats:
             if feedback.isCanceled():
                 break
-
-            out_feature = QgsFeature(fields)
-            out_feature.setGeometry(feature.geometry())
-            attrs = list(feature.attributes())
-
-            samples = self._collect_samples(
+            pts = self._collect_sample_lonlats(
                 feature.geometry(),
-                sampler,
                 transform,
                 to_metric,
                 to_source,
                 interior_step,
             )
+            feat_counts.append(len(pts))
+            lonlats.extend(pts)
+
+        alts = sample_lonlats_parallel(
+            mesh_folder,
+            lonlats,
+            workers=workers_req,
+            level=sampler.level,
+            feedback=feedback,
+            scripts_root=_SCRIPTS_ROOT,
+        )
+
+        offset = 0
+        for current, feature in enumerate(feats):
+            if feedback.isCanceled():
+                break
+            n = feat_counts[current] if current < len(feat_counts) else 0
+            chunk = alts[offset : offset + n]
+            offset += n
+
+            out_feature = QgsFeature(fields)
+            out_feature.setGeometry(feature.geometry())
+            attrs = list(feature.attributes())
+
+            samples = []
+            for alt in chunk:
+                if alt is None:
+                    continue
+                try:
+                    z = float(alt)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(z):
+                    samples.append(z)
             median_z = self._median(samples)
             attrs.append(median_z)
             if median_z is None:
@@ -222,6 +269,80 @@ class WaterMedianAltitudeAlgorithm(QgsProcessingAlgorithm):
             )
         )
         return {self.OUTPUT: dest_id}
+
+    def _collect_sample_lonlats(
+        self, geometry, transform, to_metric, to_source, interior_step
+    ):
+        """WGS84 sample coordinates (no mesh I/O)."""
+        pts = []
+        if geometry is None or geometry.isEmpty():
+            return pts
+        for exterior in self._exterior_rings(geometry):
+            self._ring_lonlats(exterior, transform, pts)
+        try:
+            pos = geometry.pointOnSurface().asPoint()
+            self._append_lonlat(pos.x(), pos.y(), transform, pts)
+        except Exception:
+            pass
+        if interior_step > 0:
+            self._interior_grid_lonlats(
+                geometry, transform, to_metric, to_source, interior_step, pts
+            )
+        return pts
+
+    def _ring_lonlats(self, ring, transform, pts):
+        if not ring:
+            return
+        n = len(ring)
+        for i in range(n):
+            self._append_lonlat(ring[i][0], ring[i][1], transform, pts)
+            if i + 1 >= n:
+                continue
+            x1, y1 = ring[i][0], ring[i][1]
+            x2, y2 = ring[i + 1][0], ring[i + 1][1]
+            self._append_lonlat(
+                0.5 * (x1 + x2), 0.5 * (y1 + y2), transform, pts
+            )
+
+    @staticmethod
+    def _append_lonlat(x, y, transform, pts):
+        if transform is not None:
+            p = transform.transform(x, y)
+            x, y = p.x(), p.y()
+        pts.append((x, y))
+
+    def _interior_grid_lonlats(
+        self, geometry, transform, to_metric, to_source, step, pts
+    ):
+        geom = QgsGeometry(geometry)
+        if to_metric is not None:
+            if geom.transform(to_metric) != 0:
+                return
+        bbox = geom.boundingBox()
+        if bbox.isEmpty():
+            return
+        max_cells = 40
+        width = max(bbox.width(), 1e-6)
+        height = max(bbox.height(), 1e-6)
+        nx = min(max(1, int(math.floor(width / step))), max_cells)
+        ny = min(max(1, int(math.floor(height / step))), max_cells)
+        dx = width / (nx + 1)
+        dy = height / (ny + 1)
+        xmin = bbox.xMinimum()
+        ymin = bbox.yMinimum()
+        for ix in range(1, nx + 1):
+            for iy in range(1, ny + 1):
+                mx = xmin + ix * dx
+                my = ymin + iy * dy
+                probe = QgsGeometry.fromPointXY(QgsPointXY(mx, my))
+                if not geom.intersects(probe):
+                    continue
+                if to_source is not None:
+                    sx = to_source.transform(QgsPointXY(mx, my))
+                    x, y = sx.x(), sx.y()
+                else:
+                    x, y = mx, my
+                self._append_lonlat(x, y, transform, pts)
 
     def _collect_samples(
         self, geometry, sampler, transform, to_metric, to_source, interior_step
