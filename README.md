@@ -14,9 +14,19 @@ scripts/
   line_of_sight/         # Line-of-Sight checker
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
+webapp/                  # Local browser UI over qgis_process
+Database/                # Named input/output folders for the UI
 ```
 
-When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) (and for flatten: `parallel_util.py`, `mesh_flatten_workers.py`) available under the same `scripts/` parent.
+When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) (and for flatten: `parallel_util.py`, `mesh_flatten_workers.py`) available under the same `scripts/` parent. Shared helpers: [`scripts/crs_util.py`](scripts/crs_util.py), [`scripts/atomic_io.py`](scripts/atomic_io.py).
+
+### Output CRS
+
+**All vector outputs are written in EPSG:4326 (WGS84).** Inputs may use any CRS; tools transform geometries on write. Mesh sampling and RGB raster lookups still work in the appropriate source/raster CRS internally.
+
+### Atomic outputs
+
+Vector tools and road-mesh flatten write to a sibling ``*.partial`` path and only rename into the final location after a successful finish. Cancel/error deletes the partial so the named output is not left half-written. A hard process kill can leave an orphan ``*.partial``; the final name stays untouched until replace succeeds.
 
 ### Worker processes
 
@@ -260,4 +270,21 @@ Copy **both** `assign_roof_type.py` and `roof_type_core.py` into the QGIS script
 1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
 2. Select `scripts/roof_type/assign_roof_type.py`
 3. Run **QGIS Projects → Assign roof type from zones**
+
+## Browser UI (local)
+
+Folder: [`webapp/`](webapp/) — tabbed localhost UI over `qgis_process` (QGIS must be installed; Desktop app not required).
+
+1. Put inputs under [`Database/`](Database/) (see that folder’s README for layout).
+2. Ensure Processing scripts are in the QGIS scripts folder (same as Toolbox install).
+3. Run:
+
+```bat
+webapp\run.bat
+```
+
+Or: `python webapp\app.py` after `pip install -r webapp\requirements.txt`.
+
+Opens **http://127.0.0.1:8080** — pick tools by tab → Configure → Run queue.
+Optional: set `QGIS_PROCESS_BAT` if auto-detect misses your install.
 

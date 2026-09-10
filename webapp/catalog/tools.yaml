@@ -1,0 +1,413 @@
+# Tool catalog for the browser UI. Scripts stay the QGIS Processing engines.
+# algorithm_id is the qgis_process id (script:name).
+
+tabs:
+  - id: trees
+    label: Trees
+    icon: park
+  - id: buildings
+    label: Buildings
+    icon: apartment
+  - id: roads
+    label: Roads
+    icon: route
+  - id: water
+    label: Water
+    icon: water_drop
+  - id: common
+    label: Common
+    icon: hub
+
+# Maps under Database/<map_id>/…
+maps:
+  - id: Fort_Riley
+    label: Fort Riley
+  - id: Nablus
+    label: Nablus
+  - id: GFK
+    label: GFK
+
+# Domain roots under each map.
+# source_domains get source/working/tests; others only working/tests (tool outputs).
+domains:
+  buildings_footprints: buildings/footprints
+  buildings_zones: buildings/zones
+  trees_footprints: trees/footprints
+  trees_points: trees/points
+  roads_vectors: roads/vectors
+  roads_masks: roads/masks
+  roads_outline_points: roads/outline_points
+  water_footprints: water/footprints
+  mesh: mesh
+  imagery: imagery
+
+# Immutable imports — only these domains create a source/ tier.
+source_domains:
+  - buildings_footprints
+  - trees_footprints
+  - roads_vectors
+  - water_footprints
+  - mesh
+  - imagery
+
+tiers: [source, working, tests]
+# Input pickers scan in this order (working = current best). source skipped if N/A.
+input_tiers: [working, source, tests]
+
+# Hardcoded chains: selected tools in a chain run in this order.
+# wire: previous = use the previous *selected* step's primary output as that input.
+pipelines:
+  - id: trees
+    label: Trees
+    steps:
+      - id: tree_mask_to_points
+      - id: thin_tree_points
+        wire:
+          INPUT_POINTS: previous
+      - id: sample_tree_rgb
+        wire:
+          INPUT_POINTS: previous
+  - id: buildings
+    label: Buildings
+    steps:
+      - id: building_altitude_and_height
+      - id: assign_roof_type
+        wire:
+          INPUT_BUILDINGS: previous
+  - id: roads
+    label: Roads
+    steps:
+      - id: polygon_mask_points
+      - id: flatten_road_mesh
+        wire:
+          INPUT_OUTLINE_POINTS: previous
+
+tools:
+  - id: tree_mask_to_points
+    algorithm: script:tree_mask_to_points
+    display_name: Tree mask polygons to spaced points
+    tabs: [trees]
+    description: Place spaced PointZ samples inside tree footprints, clearing buildings.
+    params:
+      - id: INPUT_POLYGONS
+        label: Tree footprints
+        type: vector_file
+        library: trees_footprints
+        required: true
+      - id: INPUT_BUILDINGS
+        label: Buildings footprints
+        type: vector_file
+        library: buildings_footprints
+        required: true
+      - id: INPUT_MESH
+        label: Quantized-mesh (highest LOD)
+        type: folder
+        library: mesh
+        mesh_pick: lod
+        required: true
+      - id: MIN_DISTANCE
+        label: Minimum distance between points (m)
+        type: number
+        default: 1.5
+        min: 0.01
+      - id: BUILDING_CLEARANCE
+        label: Clearance from buildings (m)
+        type: number
+        default: 1.0
+        min: 0.0
+      - id: WORKERS
+        label: Worker processes (0=auto, 1=serial)
+        type: integer
+        default: 0
+        min: 0
+      - id: OUTPUT
+        label: Spaced tree points
+        type: vector_output
+        domain: trees_points
+        default_tier: working
+        default_name: tree_points.gpkg
+        required: true
+
+  - id: thin_tree_points
+    algorithm: script:thin_tree_points
+    display_name: Thin tree points
+    tabs: [trees]
+    description: Keep a random fraction of tree points (input not overwritten).
+    params:
+      - id: INPUT_POINTS
+        label: Tree points
+        type: vector_file
+        library: trees_points
+        required: true
+      - id: KEEP_FRACTION
+        label: Keep fraction (0–1)
+        type: number
+        default: 0.4
+        min: 0.0
+        max: 1.0
+      - id: SEED
+        label: Random seed (-1 = none)
+        type: integer
+        default: 42
+      - id: OUTPUT
+        label: Thinned tree points
+        type: vector_output
+        domain: trees_points
+        default_tier: working
+        default_name: tree_points_thinned.gpkg
+        required: true
+
+  - id: sample_tree_rgb
+    algorithm: script:sample_tree_rgb
+    display_name: Sample tree RGB from GeoTIFF
+    tabs: [trees]
+    description: Sample R/G/B from imagery and attach to tree points.
+    params:
+      - id: INPUT_POINTS
+        label: Tree points
+        type: vector_file
+        library: trees_points
+        required: true
+      - id: INPUT_FOLDER
+        label: Imagery folder (TIFF)
+        type: folder
+        library: imagery
+        required: true
+      - id: OUTPUT
+        label: Trees with RGB
+        type: vector_output
+        domain: trees_points
+        default_tier: working
+        default_name: tree_points_rgb.gpkg
+        required: true
+
+  - id: building_altitude_and_height
+    algorithm: script:building_altitude_and_height
+    display_name: Building altitude and random height
+    tabs: [buildings]
+    description: Add altitude, max_altitude, and random height from mesh.
+    params:
+      - id: INPUT_BUILDINGS
+        label: Buildings footprints
+        type: vector_file
+        library: buildings_footprints
+        required: true
+      - id: INPUT_MESH
+        label: Quantized-mesh (highest LOD)
+        type: folder
+        library: mesh
+        mesh_pick: lod
+        required: true
+      - id: MIN_VALUE
+        label: Minimum random height component
+        type: number
+        default: 0.0
+      - id: MAX_VALUE
+        label: Maximum random height component
+        type: number
+        default: 1.0
+      - id: SEED
+        label: Random seed (-1 = none)
+        type: integer
+        default: -1
+      - id: WORKERS
+        label: Worker processes (0=auto, 1=serial)
+        type: integer
+        default: 0
+        min: 0
+      - id: OUTPUT
+        label: Buildings with altitude and height
+        type: vector_output
+        domain: buildings_footprints
+        default_tier: working
+        default_name: buildings_altitude.gpkg
+        required: true
+
+  - id: assign_roof_type
+    algorithm: script:assign_roof_type
+    display_name: Assign roof type from zones
+    tabs: [buildings]
+    description: Assign roof_type from zone polygons.
+    params:
+      - id: INPUT_BUILDINGS
+        label: Buildings footprints
+        type: vector_file
+        library: buildings_footprints
+        required: true
+      - id: INPUT_ZONES
+        label: Roof type zones
+        type: vector_file
+        library: buildings_zones
+        required: true
+      - id: SEED
+        label: Random seed (-1 = none)
+        type: integer
+        default: 42
+      - id: OUTPUT
+        label: Buildings with roof_type
+        type: vector_output
+        domain: buildings_footprints
+        default_tier: working
+        default_name: buildings_roof_type.gpkg
+        required: true
+
+  - id: polygon_mask_points
+    algorithm: script:polygon_mask_points
+    display_name: Polygon mask points with altitude
+    tabs: [roads]
+    description: Outline PointZ samples along road masks (for flatten / Unreal).
+    params:
+      - id: INPUT_POLYGONS
+        label: Polygons
+        type: vector_file
+        library: roads_masks
+        required: true
+      - id: INPUT_MESH
+        label: Quantized-mesh (highest LOD)
+        type: folder
+        library: mesh
+        mesh_pick: lod
+        required: true
+      - id: SPACING
+        label: Outline point spacing (m)
+        type: number
+        default: 5.0
+        min: 0.01
+      - id: ADD_CENTER_POINTS
+        label: Add center points (legacy)
+        type: boolean
+        default: false
+      - id: CENTER_MODE
+        label: Center point mode (legacy)
+        type: enum
+        options: ["Sparse grid (legacy)", "Chord midpoints (legacy)"]
+        default: 0
+      - id: CENTER_GRID_SPACING
+        label: Center grid spacing (m, legacy)
+        type: number
+        default: 5.0
+        min: 0.01
+      - id: WORKERS
+        label: Worker processes (0=auto, 1=serial)
+        type: integer
+        default: 0
+        min: 0
+      - id: OUTPUT
+        label: Mask points with altitude
+        type: vector_output
+        domain: roads_outline_points
+        default_tier: working
+        default_name: road_outline_points.gpkg
+        required: true
+
+  - id: flatten_road_mesh
+    algorithm: script:flatten_road_mesh
+    display_name: Flatten road masks in quantized mesh
+    tabs: [roads]
+    description: Copy tileset and flatten / lower DTM under road masks.
+    params:
+      - id: INPUT_MASKS
+        label: Road mask polygons
+        type: vector_file
+        library: roads_masks
+        required: true
+      - id: INPUT_OUTLINE_POINTS
+        label: Outline points (PointZ; skip if lowering-only)
+        type: vector_file
+        library: roads_outline_points
+        required: false
+      - id: ALTITUDE_FIELD
+        label: Altitude field
+        type: text
+        default: altitude
+        required: false
+      - id: INPUT_MESH
+        label: Input quantized-mesh tileset (all LODs)
+        type: folder
+        library: mesh
+        mesh_pick: tileset
+        required: true
+      - id: OUTPUT_MESH
+        label: Output quantized-mesh tileset folder
+        type: folder_output
+        domain: mesh
+        default_tier: working
+        default_name: mesh_flattened
+        required: true
+      - id: NEAR_DISTANCE
+        label: Point near-mask snap (m)
+        type: number
+        default: 15.0
+        min: 0.0
+      - id: LOWERING_ONLY
+        label: Interior lowering only (skip TIN)
+        type: boolean
+        default: false
+      - id: LOWER_INTERIOR
+        label: Lower interior under mask
+        type: boolean
+        default: false
+      - id: SMOOTH_BLEND
+        label: Smooth edge blend (off = stair)
+        type: boolean
+        default: true
+      - id: EDGE_STRIP
+        label: Edge strip / blend width (m)
+        type: number
+        default: 0.5
+        min: 0.0
+      - id: INTERIOR_DROP
+        label: Max interior drop (m)
+        type: number
+        default: 0.5
+        min: 0.0
+      - id: WORKERS
+        label: Worker processes (0=auto, 1=serial)
+        type: integer
+        default: 0
+        min: 0
+
+  - id: water_median_altitude
+    algorithm: script:water_median_altitude
+    display_name: Water median quantized-mesh altitude
+    tabs: [water]
+    description: Add median mesh altitude per water polygon.
+    params:
+      - id: INPUT_WATER
+        label: Water footprints
+        type: vector_file
+        library: water_footprints
+        required: true
+      - id: INPUT_MESH
+        label: Quantized-mesh (highest LOD)
+        type: folder
+        library: mesh
+        mesh_pick: lod
+        required: true
+      - id: INTERIOR_STEP
+        label: Interior sample step (m, 0 = outline only)
+        type: number
+        default: 25.0
+        min: 0.0
+      - id: WORKERS
+        label: Worker processes (0=auto, 1=serial)
+        type: integer
+        default: 0
+        min: 0
+      - id: OUTPUT
+        label: Water with altitude
+        type: vector_output
+        domain: water_footprints
+        default_tier: working
+        default_name: water_altitude.gpkg
+        required: true
+
+  - id: layers_alignment
+    display_name: Layers alignment
+    tabs: [common]
+    placeholder: true
+    description: >
+      Coming soon — remove overlaps by priority (roads → water → buildings → trees):
+      drop trees on buildings/roads/water, buildings on roads/water, and water on roads.
+      (Trees may be masks or points; TBD when implemented.)
+    params: []

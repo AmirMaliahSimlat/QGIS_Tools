@@ -48,6 +48,7 @@ from quantized_mesh import (  # noqa: E402
     replace_tile_altitudes,
     write_terrain_file,
 )
+from atomic_io import begin_atomic_dir_output  # noqa: E402
 
 ALTITUDE_FIELD_DEFAULT = "altitude"
 ROLE_FIELD = "point_role"
@@ -342,190 +343,195 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                 )
 
         in_path = os.path.abspath(mesh_in)
-        out_path = os.path.abspath(mesh_out)
-        if os.path.normcase(in_path) == os.path.normcase(out_path):
+        final_out = os.path.abspath(mesh_out)
+        if os.path.normcase(in_path) == os.path.normcase(final_out):
             raise QgsProcessingException(
                 self.tr("Output folder must differ from the input mesh.")
             )
-        if os.path.exists(out_path) and os.listdir(out_path):
-            raise QgsProcessingException(
-                self.tr(
-                    "Output folder exists and is not empty. "
-                    "Choose an empty or new folder."
-                )
-            )
+        try:
+            atomic = begin_atomic_dir_output(final_out)
+        except FileExistsError as exc:
+            raise QgsProcessingException(self.tr(str(exc))) from exc
+        # All writes go to *.partial; published only on success.
+        out_path = str(atomic.temp)
+        published = None
+        try:
+            progress = _PhaseProgress(feedback, self.tr)
 
-        progress = _PhaseProgress(feedback, self.tr)
+            # --- Phase 1: copy tileset ---
+            if lowering_only:
+                progress.begin("1/3 Copy tileset", 0, 20)
+            else:
+                progress.begin("1/5 Copy tileset", 0, 20)
+            _fast_copy_tileset(in_path, out_path, feedback, progress, self.tr)
 
-        # --- Phase 1: copy tileset ---
-        if lowering_only:
-            progress.begin("1/3 Copy tileset", 0, 20)
-        else:
-            progress.begin("1/5 Copy tileset", 0, 20)
-        os.makedirs(out_path, exist_ok=True)
-        _fast_copy_tileset(in_path, out_path, feedback, progress, self.tr)
-
-        # --- Build surface (TIN + optional drop, or drop-only) ---
-        if lowering_only:
-            feedback.pushInfo(
-                self.tr(
-                    "Interior-lowering-only mode: skipping Delaunay / TIN "
-                    f"flatten; drop −{interior_drop_m} m "
-                    f"(strip {edge_strip_m} m, "
-                    f"{'smooth' if smooth_blend else 'stair'})."
-                )
-            )
-            progress.begin("2/3 Prepare masks", 20, 40)
-            surface = self._build_lowering_surface(
-                masks_layer,
-                feedback,
-                progress,
-                interior_drop_m=interior_drop_m,
-                edge_blend_m=edge_strip_m,
-                smooth_blend=smooth_blend,
-            )
-            progress.begin("3/3 Lower mesh interiors", 40, 100)
-        else:
-            progress.begin("2/5 Build road TIN", 20, 50)
-            surface = self._build_road_surface(
-                masks_layer,
-                points_source,
-                alt_field,
-                near_m,
-                feedback,
-                progress,
-                interior_drop_m=interior_drop_m,
-                edge_strip_m=edge_strip_m,
-                smooth_blend=smooth_blend,
-            )
-            if not surface.triangles:
-                raise QgsProcessingException(
+            # --- Build surface (TIN + optional drop, or drop-only) ---
+            if lowering_only:
+                feedback.pushInfo(
                     self.tr(
-                        "No Delaunay triangles kept inside masks. "
-                        "Check outline points, altitude field, and near distance."
+                        "Interior-lowering-only mode: skipping Delaunay / TIN "
+                        f"flatten; drop −{interior_drop_m} m "
+                        f"(strip {edge_strip_m} m, "
+                        f"{'smooth' if smooth_blend else 'stair'})."
                     )
                 )
-            feedback.pushInfo(
-                self.tr(
-                    f"Kept {len(surface.triangles)} road triangles from "
-                    f"{surface.n_outline_used} samples "
-                    f"({surface.n_masks} masks; "
-                    f"mask-ring verts={surface.n_ring_verts})."
+                progress.begin("2/3 Prepare masks", 20, 40)
+                surface = self._build_lowering_surface(
+                    masks_layer,
+                    feedback,
+                    progress,
+                    interior_drop_m=interior_drop_m,
+                    edge_blend_m=edge_strip_m,
+                    smooth_blend=smooth_blend,
                 )
+                progress.begin("3/3 Lower mesh interiors", 40, 100)
+            else:
+                progress.begin("2/5 Build road TIN", 20, 50)
+                surface = self._build_road_surface(
+                    masks_layer,
+                    points_source,
+                    alt_field,
+                    near_m,
+                    feedback,
+                    progress,
+                    interior_drop_m=interior_drop_m,
+                    edge_strip_m=edge_strip_m,
+                    smooth_blend=smooth_blend,
+                )
+                if not surface.triangles:
+                    raise QgsProcessingException(
+                        self.tr(
+                            "No Delaunay triangles kept inside masks. "
+                            "Check outline points, altitude field, and near distance."
+                        )
+                    )
+                feedback.pushInfo(
+                    self.tr(
+                        f"Kept {len(surface.triangles)} road triangles from "
+                        f"{surface.n_outline_used} samples "
+                        f"({surface.n_masks} masks; "
+                        f"mask-ring verts={surface.n_ring_verts})."
+                    )
+                )
+                progress.begin("5/5 Flatten mesh tiles", 50, 100)
+
+            progress.tick(0, 1, "discovering .terrain files…")
+            tiles = discover_terrain_tiles(out_path)
+            feedback.pushInfo(self.tr(f"Found {len(tiles)} .terrain tiles."))
+
+            from parallel_util import resolve_workers
+            from mesh_flatten_workers import (
+                init_tile_worker,
+                patch_one_tile,
+                snapshot_from_road_surface,
             )
-            progress.begin("5/5 Flatten mesh tiles", 50, 100)
 
-        progress.tick(0, 1, "discovering .terrain files…")
-        tiles = discover_terrain_tiles(out_path)
-        feedback.pushInfo(self.tr(f"Found {len(tiles)} .terrain tiles."))
+            n_workers = resolve_workers(workers_req)
+            feedback.pushInfo(
+                self.tr(f"Using {n_workers} worker process(es) for tile patch.")
+            )
 
-        from parallel_util import resolve_workers
-        from mesh_flatten_workers import (
-            init_tile_worker,
-            patch_one_tile,
-            snapshot_from_road_surface,
-        )
-
-        n_workers = resolve_workers(workers_req)
-        feedback.pushInfo(
-            self.tr(f"Using {n_workers} worker process(es) for tile patch.")
-        )
-
-        # Parent: cheap bbox / mask skips, then farm remaining tiles.
-        work = []
-        skipped_bbox = 0
-        skipped_mask = 0
-        for tile_path, level, tx, ty in tiles:
-            if feedback.isCanceled():
-                break
-            west, south, east, north = _tile_bounds_deg(level, tx, ty)
-            if not surface.bounds_intersect(west, south, east, north):
-                skipped_bbox += 1
-                continue
-            if not surface.tile_hits_mask(west, south, east, north):
-                skipped_mask += 1
-                continue
-            work.append((str(tile_path), int(level), int(tx), int(ty)))
-
-        examined = len(work)
-        changed_tiles = 0
-        changed_verts = 0
-        snap_data = snapshot_from_road_surface(
-            surface,
-            utm_zone=getattr(surface, "_utm_zone", 14),
-            utm_northern=getattr(surface, "_utm_northern", True),
-        )
-
-        if n_workers == 1 or len(work) <= 1:
-            init_tile_worker(_SCRIPTS_ROOT, snap_data)
-            n_work = max(len(work), 1)
-            for ti, task in enumerate(work):
+            # Parent: cheap bbox / mask skips, then farm remaining tiles.
+            work = []
+            skipped_bbox = 0
+            skipped_mask = 0
+            for tile_path, level, tx, ty in tiles:
                 if feedback.isCanceled():
                     break
-                if ti % 25 == 0 or ti + 1 == len(work):
-                    progress.tick(
-                        ti + 1,
-                        n_work,
-                        (
-                            f"tile {ti + 1}/{len(work)} "
-                            f"patched={changed_tiles} verts={changed_verts}"
-                        ),
-                    )
-                changed, nverts, err = patch_one_tile(task)
-                if err:
-                    feedback.pushWarning(self.tr(err))
-                if changed:
-                    changed_tiles += 1
-                    changed_verts += nverts
-        else:
-            from concurrent.futures import ProcessPoolExecutor, as_completed
+                west, south, east, north = _tile_bounds_deg(level, tx, ty)
+                if not surface.bounds_intersect(west, south, east, north):
+                    skipped_bbox += 1
+                    continue
+                if not surface.tile_hits_mask(west, south, east, north):
+                    skipped_mask += 1
+                    continue
+                work.append((str(tile_path), int(level), int(tx), int(ty)))
 
-            n_work = max(len(work), 1)
-            progress.tick(0, n_work, f"0/{len(work)} tiles")
-            with ProcessPoolExecutor(
-                max_workers=n_workers,
-                initializer=init_tile_worker,
-                initargs=(_SCRIPTS_ROOT, snap_data),
-            ) as pool:
-                futures = {
-                    pool.submit(patch_one_tile, task): task for task in work
-                }
-                done = 0
-                for fut in as_completed(futures):
+            examined = len(work)
+            changed_tiles = 0
+            changed_verts = 0
+            snap_data = snapshot_from_road_surface(
+                surface,
+                utm_zone=getattr(surface, "_utm_zone", 14),
+                utm_northern=getattr(surface, "_utm_northern", True),
+            )
+
+            if n_workers == 1 or len(work) <= 1:
+                init_tile_worker(_SCRIPTS_ROOT, snap_data)
+                n_work = max(len(work), 1)
+                for ti, task in enumerate(work):
                     if feedback.isCanceled():
-                        for f in futures:
-                            f.cancel()
                         break
-                    changed, nverts, err = fut.result()
-                    done += 1
+                    if ti % 25 == 0 or ti + 1 == len(work):
+                        progress.tick(
+                            ti + 1,
+                            n_work,
+                            (
+                                f"tile {ti + 1}/{len(work)} "
+                                f"patched={changed_tiles} verts={changed_verts}"
+                            ),
+                        )
+                    changed, nverts, err = patch_one_tile(task)
                     if err:
                         feedback.pushWarning(self.tr(err))
                     if changed:
                         changed_tiles += 1
                         changed_verts += nverts
-                    if done % 10 == 0 or done == len(work):
-                        progress.tick(
-                            done,
-                            n_work,
-                            (
-                                f"tile {done}/{len(work)} "
-                                f"patched={changed_tiles} "
-                                f"verts={changed_verts}"
-                            ),
-                        )
+            else:
+                from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        feedback.setProgress(100)
-        feedback.setProgressText(self.tr("Finished"))
-        mode = "lowering-only" if lowering_only else "flatten"
-        feedback.pushInfo(
-            self.tr(
-                f"Done ({mode}). Copied mesh to {out_path}. "
-                f"Examined {examined} tiles that hit masks, "
-                f"patched {changed_tiles} tiles, {changed_verts} vertices "
-                f"(bbox-skipped {skipped_bbox}, mask-skipped {skipped_mask})."
+                n_work = max(len(work), 1)
+                progress.tick(0, n_work, f"0/{len(work)} tiles")
+                with ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    initializer=init_tile_worker,
+                    initargs=(_SCRIPTS_ROOT, snap_data),
+                ) as pool:
+                    futures = {
+                        pool.submit(patch_one_tile, task): task for task in work
+                    }
+                    done = 0
+                    for fut in as_completed(futures):
+                        if feedback.isCanceled():
+                            for f in futures:
+                                f.cancel()
+                            break
+                        changed, nverts, err = fut.result()
+                        done += 1
+                        if err:
+                            feedback.pushWarning(self.tr(err))
+                        if changed:
+                            changed_tiles += 1
+                            changed_verts += nverts
+                        if done % 10 == 0 or done == len(work):
+                            progress.tick(
+                                done,
+                                n_work,
+                                (
+                                    f"tile {done}/{len(work)} "
+                                    f"patched={changed_tiles} "
+                                    f"verts={changed_verts}"
+                                ),
+                            )
+
+            if feedback.isCanceled():
+                raise QgsProcessingException(self.tr("Canceled."))
+            published = str(atomic.finalize())
+            feedback.setProgress(100)
+            feedback.setProgressText(self.tr("Finished"))
+            mode = "lowering-only" if lowering_only else "flatten"
+            feedback.pushInfo(
+                self.tr(
+                    f"Done ({mode}). Copied mesh to {published}. "
+                    f"Examined {examined} tiles that hit masks, "
+                    f"patched {changed_tiles} tiles, {changed_verts} vertices "
+                    f"(bbox-skipped {skipped_bbox}, mask-skipped {skipped_mask})."
+                )
             )
-        )
-        return {self.OUTPUT_MESH: out_path}
+            return {self.OUTPUT_MESH: published}
+        finally:
+            if published is None:
+                atomic.abandon()
 
     def _build_road_surface(
         self,

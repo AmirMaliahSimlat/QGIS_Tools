@@ -1,6 +1,13 @@
 # Large GIS source data and generated outputs (not for GitHub)
 Nablus Data Layers/
+Fort Riley Data Layers/
+GFK Data Layers/
 Building Altitude Outputs/
+Database/*
+!Database/README.md
+
+# Local UI prefs (parameter defaults)
+webapp/user_defaults.json
 
 # Python
 __pycache__/

@@ -50,6 +50,7 @@ from quantized_mesh import (  # noqa: E402
     QuantizedMeshSampler,
     sample_lonlats_parallel,
 )
+from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
 
 ALTITUDE_FIELD = "altitude"
 ROLE_FIELD = "point_role"
@@ -252,15 +253,18 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField(ALTITUDE_FIELD, QVariant.Double))
         fields.append(QgsField(ROLE_FIELD, QVariant.String))
 
+        sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
-            parameters,
+            sink_params,
             self.OUTPUT,
             context,
             fields,
             QgsWkbTypes.PointZ,
-            source_crs,
+            wgs84,
         )
         if sink is None:
+            if atomic:
+                atomic.abandon()
             raise QgsProcessingException(
                 self.tr("Could not create output sink.")
             )
@@ -270,12 +274,14 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         written_outline = 0
         written_center = 0
         null_alt = 0
+        canceled = False
         progress = _Progress(feedback, n_poly, self.tr)
 
         # Collect (src_x, src_y, lon, lat, role) then mesh-sample in parallel.
         pending = []
         for i, feature in enumerate(features):
             if feedback.isCanceled():
+                canceled = True
                 break
 
             progress.begin_polygon(i, feature.id())
@@ -290,6 +296,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             n_rings = max(len(rings), 1)
             for r_idx, ring in enumerate(rings):
                 if feedback.isCanceled():
+                    canceled = True
                     break
                 metric_ring = []
                 for pt in ring:
@@ -300,6 +307,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 n_pts = max(len(densified), 1)
                 for p_idx, (mx, my) in enumerate(densified):
                     if feedback.isCanceled():
+                        canceled = True
                         break
                     src_pt = to_source.transform(QgsPointXY(mx, my))
                     wgs = to_wgs84.transform(src_pt)
@@ -323,6 +331,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 n_parts = max(len(parts), 1)
                 for part_idx, metric_poly in enumerate(parts):
                     if feedback.isCanceled():
+                        canceled = True
                         break
 
                     def _center_progress(done, total, label="centers"):
@@ -375,21 +384,27 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
 
             progress.finish_polygon(written_outline, written_center, "queued")
 
-        lonlats = [(p[2], p[3]) for p in pending]
-        feedback.pushInfo(
-            self.tr(f"Sampling altitudes for {len(lonlats)} points…")
-        )
-        alts = sample_lonlats_parallel(
-            mesh_folder,
-            lonlats,
-            workers=workers_req,
-            level=sampler.level,
-            feedback=feedback,
-            scripts_root=_SCRIPTS_ROOT,
-        )
+        if feedback.isCanceled():
+            canceled = True
 
-        for (sx, sy, _lo, _la, role), alt in zip(pending, alts):
+        lonlats = [(p[2], p[3]) for p in pending]
+        alts = []
+        if not canceled:
+            feedback.pushInfo(
+                self.tr(f"Sampling altitudes for {len(lonlats)} points…")
+            )
+            alts = sample_lonlats_parallel(
+                mesh_folder,
+                lonlats,
+                workers=workers_req,
+                level=sampler.level,
+                feedback=feedback,
+                scripts_root=_SCRIPTS_ROOT,
+            )
+
+        for (_sx, _sy, lon, lat, role), alt in zip(pending, alts):
             if feedback.isCanceled():
+                canceled = True
                 break
             try:
                 alt_f = float(alt) if alt is not None else None
@@ -402,7 +417,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             else:
                 z = alt_f
             out = QgsFeature(fields)
-            out.setGeometry(QgsGeometry(QgsPoint(sx, sy, z)))
+            out.setGeometry(QgsGeometry(QgsPoint(lon, lat, z)))
             out.setAttributes([alt_f, role])
             sink.addFeature(out, QgsFeatureSink.FastInsert)
             if role == ROLE_CENTER:
@@ -410,6 +425,11 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             else:
                 written_outline += 1
 
+        ok = not canceled
+        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        sink = None
+        if canceled:
+            raise QgsProcessingException(self.tr("Canceled."))
         feedback.setProgress(100)
         mode_note = ""
         if add_center_points:
@@ -424,7 +444,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 f"{spacing} m{mode_note})."
             )
         )
-        return {self.OUTPUT: dest_id}
+        return {self.OUTPUT: published or dest_id}
 
     def _sample_metric_xy(self, mx, my, to_source, to_wgs84, sampler):
         """Return (alt_or_None, z_for_geom, ok)."""

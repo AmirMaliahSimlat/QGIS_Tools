@@ -6,11 +6,19 @@ Places points on a hexagonal lattice so every pair is at least
 ``min_distance`` meters apart, keeps only points that fall inside the
 input polygons, and samples terrain altitude from a Cesium quantized-mesh
 tileset into a hardcoded ``altitude`` attribute (and PointZ Z).
+
+Packing notes:
+- Multipart features are packed per-part (each part's own bbox) so empty
+  space between parts is not scanned.
+- Uses prepared GEOS engines for fast point-in-polygon / building tests.
+- Primary hex phase only; half-offset fill phases run only when a feature
+  still has zero points (centroid fallback remains as last resort).
 """
 
 import math
 import os
 import sys
+import time
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (
@@ -31,6 +39,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
     QgsProject,
+    QgsRectangle,
     QgsSpatialIndex,
     QgsWkbTypes,
 )
@@ -45,6 +54,7 @@ from quantized_mesh import (  # noqa: E402
     QuantizedMeshSampler,
     sample_lonlats_parallel,
 )
+from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
 
 ALTITUDE_FIELD = "altitude"
 
@@ -182,21 +192,6 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                 self.tr("Building clearance must be ≥ 0.")
             )
 
-        feedback.setProgressText(self.tr("Opening quantized-mesh…"))
-        try:
-            sampler = QuantizedMeshSampler(mesh_folder)
-        except Exception as exc:
-            raise QgsProcessingException(
-                self.tr(f"Failed to open quantized-mesh tileset: {exc}")
-            ) from exc
-
-        feedback.pushInfo(
-            self.tr(
-                f"Using geographic quantized-mesh level {sampler.level} "
-                f"({len(sampler.tiles_index)} tiles)."
-            )
-        )
-
         source_crs = layer.sourceCrs()
         metric_crs = self._metric_crs_for_layer(layer, feedback)
         to_metric = QgsCoordinateTransform(
@@ -212,8 +207,10 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
 
         feedback.setProgressText(self.tr("Preparing polygons…"))
         metric_features = []
+        canceled = False
         for idx, feature in enumerate(layer.getFeatures()):
             if feedback.isCanceled():
+                canceled = True
                 break
             geom = feature.geometry()
             if geom is None or geom.isEmpty():
@@ -243,9 +240,11 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         )
 
         feedback.setProgressText(self.tr("Indexing buildings…"))
-        bldg_index, bldg_geoms, n_bldg = self._index_buildings(
+        bldg_index, bldg_engines, n_bldg = self._index_buildings(
             buildings, metric_crs, clearance, feedback
         )
+        if feedback.isCanceled():
+            canceled = True
         feedback.pushInfo(
             self.tr(
                 f"Excluding {n_bldg} buildings with {clearance} m clearance."
@@ -256,9 +255,11 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         # projected metres; otherwise use the local UTM zone.
         dx = min_dist
         dy = min_dist * math.sqrt(3.0) / 2.0
-        # Extra phases fill gaps, but every candidate must pass a meter check.
-        phases = (
-            (0.0, 0.0),
+        # Primary hex lattice already enforces ≥ min_dist between neighbors.
+        # Extra half-offset phases only fill holes left by PIP/building rejects;
+        # run them only when a feature still has zero points.
+        primary_phases = ((0.0, 0.0),)
+        fill_phases = (
             (0.5 * dx, 0.0),
             (0.0, 0.5 * dy),
             (0.5 * dx, 0.5 * dy),
@@ -271,38 +272,90 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         grid = {}
         covered_ids = set()
 
-        feedback.setProgressText(self.tr("Placing points in masks…"))
+        feedback.setProgressText(self.tr("Placing points in masks..."))
+        last_report = 0.0
+        last_pct = -1
         for i, mf in enumerate(metric_features):
             if feedback.isCanceled():
+                canceled = True
                 break
-            if i % 25 == 0 or i + 1 == n_poly:
-                feedback.setProgress(int(55.0 * i / max(n_poly, 1)))
-                feedback.setProgressText(
-                    self.tr(
-                        f"Placing points… {i + 1}/{n_poly} polygons "
-                        f"({len(accepted_metric)} points so far)"
-                    )
-                )
+            done = i + 1
+            pct = int(90.0 * done / max(n_poly, 1))
+            if pct != last_pct:
+                last_pct = pct
+                feedback.setProgress(pct)
 
             geom = mf.geometry()
-            bbox = geom.boundingBox()
+            parts = self._geometry_parts(geom)
             placed = 0
-            for ox, oy in phases:
-                for pt in self._hex_points_local(bbox, dx, dy, ox, oy):
-                    probe = QgsGeometry.fromPointXY(pt)
-                    # intersects: include boundary (contains often excludes it)
-                    if not geom.intersects(probe):
+            probes = 0
+            poly_t0 = time.monotonic()
+
+            def _report(now: float, *, force: bool = False) -> None:
+                nonlocal last_report
+                if not force and (now - last_report) < 0.35:
+                    return
+                last_report = now
+                if probes > 0 or (now - poly_t0) >= 0.35:
+                    feedback.setProgressText(
+                        self.tr(
+                            f"Placing points... {done}/{n_poly} polygons "
+                            f"(#{done}: {probes} probes, {placed} hits, "
+                            f"{now - poly_t0:.0f}s) — "
+                            f"{len(accepted_metric)} points so far"
+                        )
+                    )
+                else:
+                    feedback.setProgressText(
+                        self.tr(
+                            f"Placing points... {done}/{n_poly} polygons "
+                            f"({len(accepted_metric)} points so far)"
+                        )
+                    )
+
+            _report(poly_t0, force=False)
+
+            def _pack_phases(phase_list) -> None:
+                nonlocal placed, probes, canceled
+                for part in parts:
+                    if canceled:
+                        return
+                    engine = self._prepare_engine(part)
+                    if engine is None:
                         continue
-                    xy = (pt.x(), pt.y())
-                    if self._blocked_by_building(
-                        xy, bldg_index, bldg_geoms
-                    ):
-                        continue
-                    if not self._far_enough_grid(xy, grid, cell, min_dist_sq):
-                        continue
-                    accepted_metric.append(xy)
-                    self._grid_insert(grid, cell, xy)
-                    placed += 1
+                    bbox = part.boundingBox()
+                    for ox, oy in phase_list:
+                        if canceled:
+                            return
+                        for x, y in self._hex_points_xy(bbox, dx, dy, ox, oy):
+                            probes += 1
+                            now = time.monotonic()
+                            if (now - last_report) >= 1.0:
+                                _report(now, force=True)
+                                if feedback.isCanceled():
+                                    canceled = True
+                                    return
+                            # Prepared GEOS point test — no per-probe QgsGeometry.
+                            if not engine.intersects(QgsPoint(x, y)):
+                                continue
+                            xy = (x, y)
+                            if self._blocked_by_building(
+                                xy, bldg_index, bldg_engines
+                            ):
+                                continue
+                            if not self._far_enough_grid(
+                                xy, grid, cell, min_dist_sq
+                            ):
+                                continue
+                            accepted_metric.append(xy)
+                            self._grid_insert(grid, cell, xy)
+                            placed += 1
+
+            _pack_phases(primary_phases)
+            if placed == 0 and not canceled:
+                _pack_phases(fill_phases)
+            if canceled:
+                break
             if placed:
                 covered_ids.add(mf.id())
 
@@ -314,21 +367,29 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                 f"{len(leftovers)} polygons need centroid fallback."
             )
         )
-        feedback.setProgressText(self.tr("Placing leftover centroids…"))
+        feedback.setProgressText(self.tr("Placing leftover centroids..."))
 
         for j, mf in enumerate(leftovers):
             if feedback.isCanceled():
+                canceled = True
                 break
-            if j % 50 == 0 or j + 1 == len(leftovers):
+            if leftovers:
                 feedback.setProgress(
-                    55 + int(10.0 * j / max(len(leftovers), 1))
+                    90 + int(5.0 * (j + 1) / max(len(leftovers), 1))
                 )
+                if j % 25 == 0 or j + 1 == len(leftovers):
+                    feedback.setProgressText(
+                        self.tr(
+                            f"Centroid fallback... {j + 1}/{len(leftovers)} polygons"
+                        )
+                    )
 
             geom = mf.geometry()
+            engine = self._prepare_engine(geom)
             centroid = geom.centroid().asPoint()
             cxy = (centroid.x(), centroid.y())
-            if not geom.intersects(
-                QgsGeometry.fromPointXY(QgsPointXY(cxy[0], cxy[1]))
+            if engine is None or not engine.intersects(
+                QgsPoint(cxy[0], cxy[1])
             ):
                 try:
                     p = geom.pointOnSurface().asPoint()
@@ -337,7 +398,7 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                     continue
             if not self._far_enough_grid(cxy, grid, cell, min_dist_sq):
                 continue
-            if self._blocked_by_building(cxy, bldg_index, bldg_geoms):
+            if self._blocked_by_building(cxy, bldg_index, bldg_engines):
                 continue
             accepted_metric.append(cxy)
             self._grid_insert(grid, cell, cxy)
@@ -373,15 +434,18 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         fields = QgsFields()
         fields.append(QgsField(ALTITUDE_FIELD, QVariant.Double))
 
+        sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
-            parameters,
+            sink_params,
             self.OUTPUT,
             context,
             fields,
             QgsWkbTypes.PointZ,
-            source_crs,
+            wgs84,
         )
         if sink is None:
+            if atomic:
+                atomic.abandon()
             raise QgsProcessingException(
                 self.tr("Could not create output sink.")
             )
@@ -390,34 +454,52 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             self.tr(f"Sampling altitudes for {total_out} points…")
         )
+        feedback.setProgressText(self.tr("Opening quantized-mesh…"))
+        try:
+            sampler = QuantizedMeshSampler(mesh_folder)
+        except Exception as exc:
+            raise QgsProcessingException(
+                self.tr(f"Failed to open quantized-mesh tileset: {exc}")
+            ) from exc
+        feedback.pushInfo(
+            self.tr(
+                f"Using geographic quantized-mesh level {sampler.level} "
+                f"({len(sampler.tiles_index)} tiles)."
+            )
+        )
         feedback.setProgressText(
             self.tr(f"Sampling altitudes (0/{total_out})…")
         )
 
         # Transform once in parent; mesh samples in worker processes.
-        records = []  # (src_x, src_y, lon, lat)
+        # Output geometries are always EPSG:4326 (lon, lat, Z).
+        records = []  # (lon, lat)
         lonlats = []
         for mpt in accepted_metric:
             if feedback.isCanceled():
+                canceled = True
                 break
             src_pt = to_source.transform(QgsPointXY(mpt[0], mpt[1]))
             wgs = to_wgs84.transform(src_pt)
-            records.append((src_pt.x(), src_pt.y(), wgs.x(), wgs.y()))
+            records.append((wgs.x(), wgs.y()))
             lonlats.append((wgs.x(), wgs.y()))
 
-        alts = sample_lonlats_parallel(
-            mesh_folder,
-            lonlats,
-            workers=workers_req,
-            level=sampler.level,
-            feedback=feedback,
-            scripts_root=_SCRIPTS_ROOT,
-        )
+        alts = []
+        if not canceled:
+            alts = sample_lonlats_parallel(
+                mesh_folder,
+                lonlats,
+                workers=workers_req,
+                level=sampler.level,
+                feedback=feedback,
+                scripts_root=_SCRIPTS_ROOT,
+            )
 
         written = 0
         null_alt = 0
-        for (sx, sy, _lo, _la), alt in zip(records, alts):
+        for (lon, lat), alt in zip(records, alts):
             if feedback.isCanceled():
+                canceled = True
                 break
             try:
                 alt_f = float(alt) if alt is not None else None
@@ -431,20 +513,25 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                 z = alt_f
 
             out = QgsFeature(fields)
-            out.setGeometry(QgsGeometry(QgsPoint(sx, sy, z)))
+            out.setGeometry(QgsGeometry(QgsPoint(lon, lat, z)))
             out.setAttributes([alt_f])
             sink.addFeature(out, QgsFeatureSink.FastInsert)
             written += 1
 
+        ok = not canceled
+        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        sink = None
+        if canceled:
+            raise QgsProcessingException(self.tr("Canceled."))
         feedback.setProgress(100)
         feedback.setProgressText(self.tr("Done."))
         feedback.pushInfo(
             self.tr(
-                f"Wrote {written} points "
+                f"Wrote {written} points in EPSG:4326 "
                 f"(altitude null={null_alt}, min spacing={min_dist} m)."
             )
         )
-        return {self.OUTPUT: dest_id}
+        return {self.OUTPUT: published or dest_id}
 
     @staticmethod
     def _metric_crs_for_layer(layer, feedback):
@@ -491,13 +578,38 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         return metric
 
     @staticmethod
+    def _geometry_parts(geom):
+        """Yield ring-parts so hex packing uses each part's bbox (not the multipoly hull)."""
+        if geom is None or geom.isEmpty():
+            return []
+        if geom.isMultipart():
+            parts = []
+            for part in geom.asGeometryCollection():
+                if part is None or part.isEmpty():
+                    continue
+                parts.append(QgsGeometry(part))
+            return parts
+        return [geom]
+
+    @staticmethod
+    def _prepare_engine(geom):
+        if geom is None or geom.isEmpty():
+            return None
+        try:
+            engine = QgsGeometry.createGeometryEngine(geom.constGet())
+            engine.prepareGeometry()
+            return engine
+        except Exception:
+            return None
+
+    @staticmethod
     def _index_buildings(buildings, metric_crs, clearance, feedback):
-        """Buffered building polygons in metric CRS + spatial index."""
+        """Buffered buildings in metric CRS + spatial index + prepared engines."""
         to_metric = QgsCoordinateTransform(
             buildings.sourceCrs(), metric_crs, QgsProject.instance()
         )
         index = QgsSpatialIndex()
-        geoms = {}
+        engines = {}
         n = 0
         for feat in buildings.getFeatures():
             if feedback.isCanceled():
@@ -512,35 +624,45 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             if metric_geom.isEmpty():
                 continue
             if clearance > 0:
-                buffered = metric_geom.buffer(clearance, 8)
+                buffered = metric_geom.buffer(clearance, 5)
                 if buffered is None or buffered.isEmpty():
                     buffered = metric_geom
                 metric_geom = buffered
             stored = QgsFeature(n)
             stored.setGeometry(metric_geom)
-            geoms[n] = stored.geometry()
+            engine = TreeMaskToPointsAlgorithm._prepare_engine(metric_geom)
+            if engine is None:
+                continue
+            engines[n] = engine
             index.addFeature(stored)
             n += 1
-        return index, geoms, n
+        return index, engines, n
 
     @staticmethod
-    def _blocked_by_building(xy, index, geoms):
-        if not geoms:
+    def _blocked_by_building(xy, index, engines):
+        if not engines:
             return False
-        probe = QgsGeometry.fromPointXY(QgsPointXY(xy[0], xy[1]))
-        for fid in index.intersects(probe.boundingBox()):
-            g = geoms.get(fid)
-            if g is not None and g.intersects(probe):
+        x, y = xy
+        # Degenerate point bbox for the spatial index query.
+        rect = QgsRectangle(x, y, x, y)
+        pt = QgsPoint(x, y)
+        for fid in index.intersects(rect):
+            eng = engines.get(fid)
+            if eng is not None and eng.intersects(pt):
                 return True
         return False
 
     @staticmethod
-    def _hex_points_local(bbox, dx, dy, phase_x=0.0, phase_y=0.0):
-        """Yield hex-lattice points covering bbox, origin at bbox min + phase."""
+    def _hex_points_xy(bbox, dx, dy, phase_x=0.0, phase_y=0.0):
+        """Yield (x, y) hex-lattice points covering bbox (no QgsPointXY alloc)."""
         origin_x = bbox.xMinimum() + phase_x
         origin_y = bbox.yMinimum() + phase_y
         x_end = bbox.xMaximum() + dx
         y_end = bbox.yMaximum() + dy
+        xmin = bbox.xMinimum() - 1e-9
+        xmax = bbox.xMaximum() + 1e-9
+        ymin = bbox.yMinimum() - 1e-9
+        ymax = bbox.yMaximum() + 1e-9
 
         row = 0
         y = origin_y
@@ -548,11 +670,8 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             x_off = 0.0 if (row % 2 == 0) else (0.5 * dx)
             x = origin_x + x_off
             while x <= x_end:
-                if (
-                    bbox.xMinimum() - 1e-9 <= x <= bbox.xMaximum() + 1e-9
-                    and bbox.yMinimum() - 1e-9 <= y <= bbox.yMaximum() + 1e-9
-                ):
-                    yield QgsPointXY(x, y)
+                if xmin <= x <= xmax and ymin <= y <= ymax:
+                    yield (x, y)
                 x += dx
             y += dy
             row += 1

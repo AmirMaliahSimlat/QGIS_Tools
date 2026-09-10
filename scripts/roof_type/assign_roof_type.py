@@ -28,11 +28,14 @@ from qgis.core import (
 )
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-for _p in (_SCRIPT_DIR,):
+_SCRIPTS_ROOT = os.path.dirname(_SCRIPT_DIR)
+for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 from roof_type_core import choose_roof_type  # noqa: E402
+from crs_util import epsg_4326, to_wgs84_geometry  # noqa: E402
+from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
 
 ROOF_TYPE_FIELD = "roof_type"
 _COMPLETE_AREA_RATIO = 0.999
@@ -148,8 +151,10 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
         zone_geoms = {}
         zone_types = {}
         index = QgsSpatialIndex()
+        canceled = False
         for feat in zones.getFeatures():
             if feedback.isCanceled():
+                canceled = True
                 break
             geom = feat.geometry()
             if geom is None or geom.isEmpty():
@@ -181,15 +186,19 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
         fields = QgsFields(buildings.fields())
         fields.append(QgsField(ROOF_TYPE_FIELD, QVariant.Int))
 
+        out_crs = epsg_4326()
+        sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
-            parameters,
+            sink_params,
             self.OUTPUT,
             context,
             fields,
             buildings.wkbType(),
-            buildings.sourceCrs(),
+            out_crs,
         )
         if sink is None:
+            if atomic:
+                atomic.abandon()
             raise QgsProcessingException(
                 self.tr("Could not create output sink.")
             )
@@ -197,8 +206,10 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
         total = max(buildings.featureCount(), 1)
         assigned = 0
         nulls = 0
+        skipped_crs = 0
         for i, feature in enumerate(buildings.getFeatures()):
             if feedback.isCanceled():
+                canceled = True
                 break
             if i % 200 == 0:
                 feedback.setProgress(int(100.0 * i / total))
@@ -219,8 +230,12 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
             value = choose_roof_type(complete, partial, rng)
             attrs = list(feature.attributes())
             attrs.append(value)
+            out_geom = to_wgs84_geometry(feature.geometry(), buildings.sourceCrs())
+            if out_geom is None:
+                skipped_crs += 1
+                continue
             out = QgsFeature(fields)
-            out.setGeometry(feature.geometry())
+            out.setGeometry(out_geom)
             out.setAttributes(attrs)
             sink.addFeature(out, QgsFeatureSink.FastInsert)
             if value is None:
@@ -228,13 +243,20 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
             else:
                 assigned += 1
 
+        ok = not canceled
+        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        sink = None
+        if canceled:
+            raise QgsProcessingException(self.tr("Canceled."))
         feedback.setProgress(100)
         feedback.pushInfo(
             self.tr(
-                f"Wrote '{ROOF_TYPE_FIELD}': assigned={assigned}, null={nulls}."
+                f"Wrote '{ROOF_TYPE_FIELD}' in EPSG:4326: "
+                f"assigned={assigned}, null={nulls}"
+                f"{f', skipped CRS={skipped_crs}' if skipped_crs else ''}."
             )
         )
-        return {self.OUTPUT: dest_id}
+        return {self.OUTPUT: published or dest_id}
 
     @staticmethod
     def _classify(bgeom, index, zone_geoms, zone_types):

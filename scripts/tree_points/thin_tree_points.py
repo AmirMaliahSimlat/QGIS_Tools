@@ -6,7 +6,9 @@ Keeps a random subset of features (default 40%) so the map looks the same
 but sparser. Does not use polygons. Does not overwrite the input.
 """
 
+import os
 import random
+import sys
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
@@ -19,6 +21,15 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
 )
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS_ROOT = os.path.dirname(_SCRIPT_DIR)
+for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from crs_util import epsg_4326, to_wgs84_geometry  # noqa: E402
+from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
 
 
 class ThinTreePointsAlgorithm(QgsProcessingAlgorithm):
@@ -49,7 +60,7 @@ class ThinTreePointsAlgorithm(QgsProcessingAlgorithm):
         return self.tr(
             "Copies a random subset of points (default 40%) to a new layer. "
             "Use this to sparsify a dense tree-point layer without polygons. "
-            "The input is not overwritten."
+            "The input is not overwritten. Output CRS is always EPSG:4326."
         )
 
     def initAlgorithm(self, config=None):
@@ -110,26 +121,39 @@ class ThinTreePointsAlgorithm(QgsProcessingAlgorithm):
         rng = random.Random(None if seed < 0 else seed)
         kept = set(rng.sample(range(n), k)) if k < n else set(range(n))
 
+        sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
-            parameters,
+            sink_params,
             self.OUTPUT,
             context,
             points.fields(),
             points.wkbType(),
-            points.sourceCrs(),
+            epsg_4326(),
         )
         if sink is None:
+            if atomic:
+                atomic.abandon()
             raise QgsProcessingException(
                 self.tr("Could not create output sink.")
             )
 
         written = 0
+        skipped_crs = 0
+        canceled = False
+        src_crs = points.sourceCrs()
         for i, feat in enumerate(points.getFeatures()):
             if feedback.isCanceled():
+                canceled = True
                 break
             if i not in kept:
                 continue
-            sink.addFeature(QgsFeature(feat), QgsFeatureSink.FastInsert)
+            out = QgsFeature(feat)
+            out_geom = to_wgs84_geometry(feat.geometry(), src_crs)
+            if out_geom is None:
+                skipped_crs += 1
+                continue
+            out.setGeometry(out_geom)
+            sink.addFeature(out, QgsFeatureSink.FastInsert)
             written += 1
             if written % 5000 == 0:
                 feedback.setProgress(int(100.0 * i / max(n, 1)))
@@ -137,11 +161,17 @@ class ThinTreePointsAlgorithm(QgsProcessingAlgorithm):
                     self.tr(f"Writing {written}/{k} points…")
                 )
 
+        ok = not canceled
+        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        sink = None
+        if canceled:
+            raise QgsProcessingException(self.tr("Canceled."))
         feedback.setProgress(100)
         feedback.pushInfo(
             self.tr(
-                f"Kept {written} of {n} points "
-                f"({100.0 * written / max(n, 1):.1f}%)."
+                f"Kept {written} of {n} points in EPSG:4326 "
+                f"({100.0 * written / max(n, 1):.1f}%)"
+                f"{f', skipped CRS={skipped_crs}' if skipped_crs else ''}."
             )
         )
-        return {self.OUTPUT: dest_id}
+        return {self.OUTPUT: published or dest_id}

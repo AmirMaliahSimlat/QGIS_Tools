@@ -1,0 +1,671 @@
+/* QGIS Tools — tech console theme */
+
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@400;500;600;700&display=swap");
+
+:root {
+  --bg-0: #070b12;
+  --bg-1: #0c121c;
+  --bg-2: #121a27;
+  --bg-card: rgba(16, 24, 38, 0.78);
+  --bg-card-hover: rgba(22, 34, 52, 0.92);
+  --line: rgba(94, 234, 212, 0.14);
+  --line-strong: rgba(94, 234, 212, 0.35);
+  --text: #e8eef7;
+  --text-dim: #8b9bb0;
+  --accent: #2dd4bf;
+  --accent-2: #38bdf8;
+  --warn: #fbbf24;
+  --danger: #fb7185;
+  --ok: #34d399;
+  --radius: 12px;
+  --font-ui: "Sora", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+  background: var(--bg-0) !important;
+  color: var(--text) !important;
+  font-family: var(--font-ui) !important;
+}
+
+body {
+  background-image:
+    radial-gradient(1200px 600px at 12% -10%, rgba(45, 212, 191, 0.16), transparent 55%),
+    radial-gradient(900px 500px at 95% 0%, rgba(56, 189, 248, 0.12), transparent 50%),
+    linear-gradient(180deg, var(--bg-0), var(--bg-1) 40%, var(--bg-0)) !important;
+}
+
+/* subtle geo grid */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.045) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at center, black 35%, transparent 80%);
+}
+
+.q-page,
+.nicegui-content {
+  position: relative;
+  z-index: 1;
+}
+
+/* Header */
+.qt-header.q-header,
+.qt-header {
+  background: rgba(7, 11, 18, 0.82) !important;
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line) !important;
+  box-shadow: none !important;
+}
+
+.qt-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-left: 0.5rem;
+}
+
+.qt-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(145deg, rgba(45, 212, 191, 0.25), rgba(56, 189, 248, 0.12));
+  border: 1px solid var(--line-strong);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+}
+
+.qt-brand-title {
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  font-size: 1.05rem;
+}
+
+.qt-brand-sub {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Hero */
+.qt-hero {
+  margin-bottom: 1.25rem;
+  animation: qt-rise 0.45s ease-out both;
+}
+
+.qt-kicker {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--accent);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 0.35rem;
+}
+
+.qt-title {
+  font-size: 1.85rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin-bottom: 0.4rem;
+  background: linear-gradient(105deg, #f8fafc 20%, #99f6e4 70%, #7dd3fc 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.qt-lede {
+  color: var(--text-dim);
+  max-width: 42rem;
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+
+/* Steps */
+.qt-steps {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.25rem 0 1.25rem;
+  flex-wrap: wrap;
+}
+
+.qt-step {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.qt-step.is-active {
+  color: var(--bg-0);
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  border-color: transparent;
+  box-shadow: 0 0 24px rgba(45, 212, 191, 0.25);
+}
+
+.qt-step.is-done {
+  color: var(--accent);
+  border-color: var(--line-strong);
+}
+
+/* Panels / cards */
+.qt-panel {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow) !important;
+  backdrop-filter: blur(10px);
+}
+
+.qt-tool-card {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: none !important;
+  transition: border-color 0.15s ease, background 0.15s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.qt-tool-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: transparent;
+  transition: background 0.2s ease;
+}
+
+.qt-tool-card:hover {
+  background: var(--bg-card-hover) !important;
+  border-color: var(--line-strong) !important;
+}
+
+.qt-tool-card.is-selected {
+  border-color: rgba(45, 212, 191, 0.55) !important;
+  background: linear-gradient(110deg, rgba(45, 212, 191, 0.1), rgba(16, 24, 38, 0.85)) !important;
+}
+
+.qt-tool-card.is-selected::before {
+  background: linear-gradient(180deg, var(--accent), var(--accent-2));
+}
+
+.qt-tool-card.is-placeholder {
+  opacity: 0.72;
+  border-style: dashed;
+}
+
+.qt-tool-card.is-placeholder::before {
+  display: none;
+}
+
+.qt-tool-card.is-placeholder .qt-tool-desc {
+  margin-left: 0;
+}
+
+.qt-badge-soon {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--warn);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+  background: rgba(251, 191, 36, 0.08);
+}
+
+.qt-tool-id {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
+.qt-tool-desc {
+  color: var(--text-dim) !important;
+  font-size: 0.84rem !important;
+  line-height: 1.45;
+  margin-left: 2.1rem;
+}
+
+.qt-meta {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.qt-meta-label {
+  color: var(--accent);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.65rem;
+  margin-bottom: 0.25rem;
+}
+
+/* Tabs — left edge of tools column; Secret Mode on the same row, right */
+.qt-tabs-bar {
+  display: flex;
+  width: 100%;
+  align-items: flex-end;
+  justify-content: flex-start;
+  gap: 0.75rem;
+}
+
+.qt-tabs-bar .qt-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto !important;
+  max-width: 100%;
+}
+
+.qt-tabs-bar .qt-maple-toggle-row {
+  flex: 0 0 auto;
+  margin-left: auto;
+  align-self: flex-end;
+  margin-bottom: 0.65rem;
+}
+
+.qt-tabs .q-tabs__content {
+  justify-content: flex-start !important;
+  border-bottom: 1px solid var(--line);
+}
+
+.qt-tabs .q-tab {
+  text-transform: none;
+  font-weight: 500;
+  min-height: 100px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  color: var(--text-dim) !important;
+}
+
+.qt-tabs .q-tab--active {
+  color: var(--accent) !important;
+}
+
+.qt-tabs .q-tab__indicator {
+  background: var(--accent) !important;
+  height: 2px;
+}
+
+.qt-tabs .q-tab__content {
+  flex-direction: column !important;
+  justify-content: center;
+  gap: 0.15rem;
+}
+
+.qt-tabs .q-tab__label {
+  font-size: 0 !important;
+  width: 0 !important;
+  height: 0 !important;
+  overflow: hidden !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.qt-tab-stack {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  line-height: 1.1;
+}
+
+.qt-tab-icon-slot {
+  position: relative;
+  width: 65px;
+  height: 65px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.qt-tab-icon-normal,
+.qt-tab-icon-secret {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.28s ease, transform 0.28s ease;
+}
+
+.qt-tab-icon-normal {
+  font-size: 28px !important;
+  color: inherit;
+  opacity: 1;
+  transform: scale(1);
+}
+
+.qt-tab-icon-secret {
+  opacity: 0;
+  transform: scale(0.88);
+  pointer-events: none;
+}
+
+.qt-tabs.qt-secret .qt-tab-icon-normal {
+  opacity: 0;
+  transform: scale(0.88);
+  pointer-events: none;
+}
+
+.qt-tabs.qt-secret .qt-tab-icon-secret {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+
+.qt-tab-caption {
+  font-weight: 500;
+  font-size: 0.9rem;
+  color: inherit;
+}
+
+.q-tab-panels {
+  background: transparent !important;
+}
+
+/* Form controls */
+.q-field--outlined .q-field__control {
+  background: rgba(8, 12, 20, 0.55) !important;
+  border-radius: 10px !important;
+}
+
+.q-field--outlined .q-field__control:before {
+  border-color: var(--line) !important;
+}
+
+.q-field--outlined.q-field--highlighted .q-field__control:before,
+.q-field--outlined.q-field--focused .q-field__control:before {
+  border-color: var(--accent) !important;
+}
+
+.q-field__native,
+.q-field__input,
+.q-field__label,
+.q-placeholder {
+  color: var(--text) !important;
+}
+
+.q-field__label {
+  color: var(--text-dim) !important;
+}
+
+.q-checkbox__label,
+.q-toggle__label {
+  color: var(--text) !important;
+  font-weight: 500;
+}
+
+.q-checkbox__inner--truthy,
+.q-checkbox__inner--indet,
+.q-toggle__inner--truthy .q-toggle__thumb {
+  color: var(--accent) !important;
+}
+
+.q-toggle__track {
+  background: rgba(148, 163, 184, 0.35) !important;
+}
+
+.q-toggle__inner--truthy .q-toggle__track {
+  background: rgba(45, 212, 191, 0.55) !important;
+}
+
+/* Buttons */
+.qt-btn-primary.q-btn {
+  background: linear-gradient(100deg, #14b8a6, #0ea5e9) !important;
+  color: #041018 !important;
+  font-weight: 650 !important;
+  letter-spacing: 0.02em;
+  border-radius: 10px !important;
+  box-shadow: 0 8px 28px rgba(20, 184, 166, 0.28) !important;
+}
+
+.qt-btn-ghost.q-btn {
+  color: var(--text-dim) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 10px !important;
+}
+
+.qt-btn-ghost.q-btn:hover {
+  color: var(--text) !important;
+  border-color: var(--line-strong) !important;
+}
+
+/* Terminal log */
+.qt-log {
+  background: #05080f !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--radius) !important;
+  font-family: var(--font-mono) !important;
+  color: #9ae6c8 !important;
+  box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.45);
+}
+
+.qt-run-progress {
+  height: 10px !important;
+}
+
+.qt-run-sub-progress {
+  height: 6px !important;
+}
+
+.qt-hint {
+  font-size: 0.78rem;
+  color: var(--warn);
+  font-family: var(--font-mono);
+}
+
+.qt-set-default {
+  flex-shrink: 0;
+  font-family: var(--font-mono) !important;
+  font-size: 0.68rem !important;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* Pipeline run-order nodes */
+.qt-pipeline {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem 1.05rem;
+  box-shadow: var(--shadow);
+}
+
+.qt-pipeline-track {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0;
+}
+
+.qt-pipeline-node {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  min-width: 9.5rem;
+  max-width: 14rem;
+  padding: 0.65rem 0.8rem;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: linear-gradient(145deg, rgba(45, 212, 191, 0.12), rgba(16, 24, 38, 0.9));
+}
+
+.qt-pipeline-step {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+
+.qt-pipeline-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text);
+}
+
+.qt-pipeline-edge {
+  width: 1.6rem;
+  height: 2px;
+  margin: 0 0.15rem;
+  flex-shrink: 0;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  position: relative;
+  align-self: center;
+}
+
+.qt-pipeline-edge::after {
+  content: "";
+  position: absolute;
+  right: -1px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 4px solid transparent;
+  border-left-color: var(--accent-2);
+}
+
+.qt-footer-actions {
+  position: sticky;
+  bottom: 0;
+  padding: 0.85rem 0 0.25rem;
+  background: linear-gradient(180deg, transparent, rgba(7, 11, 18, 0.92) 35%);
+  z-index: 5;
+}
+
+.qt-select-layout {
+  align-items: flex-start;
+}
+
+.qt-select-main {
+  min-width: 0;
+}
+
+.qt-select-queue {
+  width: 17.5rem;
+  flex: 0 0 17.5rem;
+  position: sticky;
+  top: 5.5rem;
+  align-self: flex-start;
+}
+
+.qt-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-height: min(52vh, 28rem);
+  overflow: auto;
+  padding-right: 0.15rem;
+}
+
+.qt-queue-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.45rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(12, 18, 28, 0.65);
+}
+
+.qt-queue-num {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--accent);
+  line-height: 1.4;
+  min-width: 1.4rem;
+}
+
+.qt-queue-name {
+  font-size: 0.82rem;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+@keyframes qt-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Quasar dark surfaces */
+.q-card,
+.q-dialog__inner > div {
+  color: var(--text);
+}
+
+.q-menu,
+.q-select__dialog {
+  background: var(--bg-2) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--line);
+}
+
+.q-item {
+  color: var(--text) !important;
+}
+
+.q-notification {
+  border-radius: 10px !important;
+  font-family: var(--font-ui);
+}
+
+/* MapleStory easter-egg icons */
+.qt-maple-toggle-row {
+  padding: 0.15rem 0.55rem;
+  border: 1px solid rgba(251, 146, 60, 0.28);
+  border-radius: 999px;
+  background: rgba(251, 146, 60, 0.06);
+}
+
+.qt-maple-toggle .q-toggle__label {
+  font-family: var(--font-mono) !important;
+  font-size: 0.68rem !important;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #fdba74 !important;
+}
+
+.qt-maple-icon {
+  object-fit: contain;
+  display: inline-block;
+  vertical-align: middle;
+  image-rendering: auto;
+  flex-shrink: 0;
+  filter: drop-shadow(0 0 6px rgba(251, 146, 60, 0.35));
+}

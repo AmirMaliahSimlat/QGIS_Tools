@@ -32,8 +32,10 @@ from qgis.core import (
 )
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
+_SCRIPTS_ROOT = os.path.dirname(_SCRIPT_DIR)
+for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from rgb_core import (  # noqa: E402
     B_FIELD,
@@ -42,6 +44,8 @@ from rgb_core import (  # noqa: E402
     list_tiff_files,
     rgb_from_bands,
 )
+from crs_util import epsg_4326, to_wgs84_geometry  # noqa: E402
+from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
 
 _CACHE_SIZE = 16
 
@@ -100,7 +104,8 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
             "are ignored. Each point is sampled from the tile whose extent "
             "contains it (first valid tile if tiles overlap).\n\n"
             "Points outside all images, or on NoData, get NULL. Coordinates "
-            "are transformed to each raster CRS if needed."
+            "are transformed to each raster CRS if needed. Output CRS is "
+            "always EPSG:4326."
         )
 
     def initAlgorithm(self, config=None):
@@ -149,8 +154,10 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
 
         tiles = []
         skipped = 0
+        canceled = False
         for i, path in enumerate(paths):
             if feedback.isCanceled():
+                canceled = True
                 break
             if i % 25 == 0:
                 feedback.setProgressText(
@@ -206,15 +213,18 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField(G_FIELD, QVariant.Int))
         fields.append(QgsField(B_FIELD, QVariant.Int))
 
+        sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
-            parameters,
+            sink_params,
             self.OUTPUT,
             context,
             fields,
             points.wkbType(),
-            points.sourceCrs(),
+            epsg_4326(),
         )
         if sink is None:
+            if atomic:
+                atomic.abandon()
             raise QgsProcessingException(
                 self.tr("Could not create output sink.")
             )
@@ -222,8 +232,11 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
         total = max(points.featureCount(), 1)
         filled = 0
         nulls = 0
+        skipped_crs = 0
+        src_crs = points.sourceCrs()
         for i, feature in enumerate(points.getFeatures()):
             if feedback.isCanceled():
+                canceled = True
                 break
             if i % 2000 == 0:
                 feedback.setProgress(int(100.0 * i / total))
@@ -239,10 +252,14 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
                     src_xy, tiles, to_raster_xy, open_tile
                 )
 
+            out_geom = to_wgs84_geometry(geom, src_crs)
+            if out_geom is None:
+                skipped_crs += 1
+                continue
             attrs = list(feature.attributes())
             attrs.extend([r, g, b])
             out = QgsFeature(fields)
-            out.setGeometry(feature.geometry())
+            out.setGeometry(out_geom)
             out.setAttributes(attrs)
             sink.addFeature(out, QgsFeatureSink.FastInsert)
             if r is None and g is None and b is None:
@@ -250,11 +267,19 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
             else:
                 filled += 1
 
+        ok = not canceled
+        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        sink = None
+        if canceled:
+            raise QgsProcessingException(self.tr("Canceled."))
         feedback.setProgress(100)
         feedback.pushInfo(
-            self.tr(f"RGB sampled: filled={filled}, null={nulls}.")
+            self.tr(
+                f"RGB sampled in EPSG:4326: filled={filled}, null={nulls}"
+                f"{f', skipped CRS={skipped_crs}' if skipped_crs else ''}."
+            )
         )
-        return {self.OUTPUT: dest_id}
+        return {self.OUTPUT: published or dest_id}
 
     @staticmethod
     def _sample_point(src_xy, tiles, to_raster_xy, open_tile):

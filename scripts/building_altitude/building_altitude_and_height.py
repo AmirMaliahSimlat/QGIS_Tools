@@ -44,6 +44,8 @@ from quantized_mesh import (  # noqa: E402
     QuantizedMeshSampler,
     sample_lonlats_parallel,
 )
+from crs_util import epsg_4326, to_wgs84_geometry  # noqa: E402
+from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
 
 ALTITUDE_FIELD = "altitude"
 MAX_ALTITUDE_FIELD = "max_altitude"
@@ -207,15 +209,19 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField(MAX_ALTITUDE_FIELD, QVariant.Double))
         fields.append(QgsField(HEIGHT_FIELD, QVariant.Double))
 
+        out_crs = epsg_4326()
+        sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
-            parameters,
+            sink_params,
             self.OUTPUT,
             context,
             fields,
             buildings.wkbType(),
-            buildings.sourceCrs(),
+            out_crs,
         )
         if sink is None:
+            if atomic:
+                atomic.abandon()
             raise QgsProcessingException(
                 self.tr("Could not create output sink.")
             )
@@ -223,6 +229,8 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
         total = max(buildings.featureCount(), 1)
         filled = 0
         nulls = 0
+        skipped_crs = 0
+        canceled = False
 
         # Collect WGS84 sample coords per feature, then mesh-sample in parallel.
         feats = list(buildings.getFeatures())
@@ -230,30 +238,39 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
         lonlats = []
         for feature in feats:
             if feedback.isCanceled():
+                canceled = True
                 break
             pts = self._exterior_sample_lonlats(feature.geometry(), transform)
             feat_sample_counts.append(len(pts))
             lonlats.extend(pts)
 
-        alts = sample_lonlats_parallel(
-            mesh_folder,
-            lonlats,
-            workers=workers_req,
-            level=sampler.level,
-            feedback=feedback,
-            scripts_root=_SCRIPTS_ROOT,
-        )
+        alts = []
+        if not canceled:
+            alts = sample_lonlats_parallel(
+                mesh_folder,
+                lonlats,
+                workers=workers_req,
+                level=sampler.level,
+                feedback=feedback,
+                scripts_root=_SCRIPTS_ROOT,
+            )
 
         offset = 0
         for current, feature in enumerate(feats):
             if feedback.isCanceled():
+                canceled = True
                 break
             n = feat_sample_counts[current] if current < len(feat_sample_counts) else 0
             chunk = alts[offset : offset + n]
             offset += n
 
+            out_geom = to_wgs84_geometry(feature.geometry(), buildings.sourceCrs())
+            if out_geom is None:
+                skipped_crs += 1
+                continue
+
             out_feature = QgsFeature(fields)
-            out_feature.setGeometry(feature.geometry())
+            out_feature.setGeometry(out_geom)
             attrs = list(feature.attributes())
 
             min_z = None
@@ -289,13 +306,19 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
             sink.addFeature(out_feature, QgsFeatureSink.FastInsert)
             feedback.setProgress(int(100.0 * current / total))
 
+        ok = not canceled
+        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        sink = None
+        if canceled:
+            raise QgsProcessingException(self.tr("Canceled."))
         feedback.pushInfo(
             self.tr(
-                f"Wrote {ALTITUDE_FIELD}, {MAX_ALTITUDE_FIELD}, {HEIGHT_FIELD}; "
-                f"filled={filled}, null={nulls}."
+                f"Wrote {ALTITUDE_FIELD}, {MAX_ALTITUDE_FIELD}, {HEIGHT_FIELD} "
+                f"in EPSG:4326; filled={filled}, null={nulls}"
+                f"{f', skipped CRS={skipped_crs}' if skipped_crs else ''}."
             )
         )
-        return {self.OUTPUT: dest_id}
+        return {self.OUTPUT: published or dest_id}
 
     def _exterior_sample_lonlats(self, geometry, transform):
         """WGS84 (lon, lat) samples: exterior vertices + edge midpoints."""
