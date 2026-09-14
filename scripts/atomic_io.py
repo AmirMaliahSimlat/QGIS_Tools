@@ -22,33 +22,98 @@ from typing import Any, Dict, Optional, Tuple, Union
 Parameters = Dict[str, Any]
 
 
+def _parse_qgs_property_repr(text: str) -> Optional[str]:
+    """Extract static payload from ``<QgsProperty: static (...)>`` reprs."""
+    import re
+
+    text = text.strip()
+    if "QgsProperty" not in text:
+        return None
+    # static (VALUE) — VALUE may contain spaces / drive paths
+    m = re.search(r"static\s*\((.*)\)\s*>?\s*$", text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _unwrap_qgs_property(value: Any) -> Any:
+    """
+    Resolve a QgsProperty to its static destination string.
+
+    ``str(QgsProperty)`` looks like ``<QgsProperty: static (TEMPORARY_OUTPUT)>``
+    and must never be used as a filesystem path.
+    """
+    type_name = type(value).__name__
+    if type_name != "QgsProperty":
+        # Already stringified somewhere upstream
+        if isinstance(value, str) and "QgsProperty" in value:
+            parsed = _parse_qgs_property_repr(value)
+            return parsed if parsed is not None else None
+        return value
+
+    # Prefer staticValue() — valueAsString()/value() often need an expression context.
+    try:
+        if hasattr(value, "isStatic") and callable(value.isStatic) and value.isStatic():
+            return value.staticValue()
+    except Exception:
+        pass
+    try:
+        static_val = value.staticValue()
+        if static_val is not None and str(static_val).strip() != "":
+            return static_val
+    except Exception:
+        pass
+    try:
+        as_str = value.valueAsString()
+        if as_str and "QgsProperty" not in str(as_str):
+            return as_str
+    except Exception:
+        pass
+
+    parsed = _parse_qgs_property_repr(str(value))
+    return parsed  # may be None — caller must not Path() the property
+
+
 def _sink_destination(value: Any) -> Any:
     """
     Unwrap QGIS output destinations to a path / TEMPORARY_OUTPUT / memory URI.
 
-    In the Processing Toolbox, FeatureSink values are often
-    ``QgsProcessingOutputLayerDefinition`` objects. ``str(definition)`` is
-    *not* a filesystem path and must not be passed to ``Path`` / ``mkdir``.
+    Toolbox FeatureSink values are often ``QgsProcessingOutputLayerDefinition``
+    and/or ``QgsProperty``. Their ``str(...)`` forms are not filesystem paths.
     """
     if value is None:
         return None
 
-    type_name = type(value).__name__
-    if type_name == "QgsProcessingOutputLayerDefinition" or (
-        hasattr(value, "sink") and "OutputLayerDefinition" in type_name
+    # Unwrap nested wrappers a few times (definition → property → string).
+    for _ in range(4):
+        if value is None:
+            return None
+        type_name = type(value).__name__
+        if type_name == "QgsProcessingOutputLayerDefinition" or (
+            hasattr(value, "sink") and "OutputLayerDefinition" in type_name
+        ):
+            value = getattr(value, "sink", value)
+            continue
+        if type_name == "QgsProperty":
+            value = _unwrap_qgs_property(value)
+            continue
+        if isinstance(value, str) and "QgsProperty" in value:
+            value = _unwrap_qgs_property(value)
+            continue
+        # Unknown wrapper whose repr is a QgsProperty (defensive).
+        if not isinstance(value, (str, Path, bytes, int, float, bool)):
+            text = str(value)
+            if text.startswith("<QgsProperty:") or "QgsProperty: static" in text:
+                value = _parse_qgs_property_repr(text)
+                continue
+        break
+
+    if value is not None and type(value).__name__ == "QgsProperty":
+        return None
+    if isinstance(value, str) and (
+        "QgsProperty" in value or "QgsProcessingOutputLayerDefinition" in value
     ):
-        value = getattr(value, "sink", value)
-
-    # QgsProperty sometimes wraps the sink string.
-    if type(value).__name__ == "QgsProperty":
-        try:
-            value = value.valueAsString()
-        except Exception:
-            try:
-                value = value.value()
-            except Exception:
-                pass
-
+        return None
     return value
 
 
@@ -62,8 +127,8 @@ def _as_path(value: Any) -> Optional[Path]:
         text = str(value).strip()
     if not text:
         return None
-    # Never treat the definition repr as a path.
-    if "QgsProcessingOutputLayerDefinition" in text:
+    # Never treat QGIS object reprs as paths.
+    if "QgsProcessingOutputLayerDefinition" in text or "QgsProperty" in text:
         return None
     # Memory / temporary Processing destinations — not filesystem paths.
     lower = text.lower()
