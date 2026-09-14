@@ -781,7 +781,7 @@ def _param_widget(
             spec = default_output_spec(param)
             vals[pid] = spec
         else:
-            # Keep stored name as stem only (strip legacy .gpkg etc.)
+            # Keep stored name as stem only (strip legacy .gpkg/.shp etc.)
             fixed = dict(spec)
             fixed["name"] = output_name_stem(str(fixed.get("name") or "")) or default_output_spec(
                 param

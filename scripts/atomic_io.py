@@ -22,7 +22,38 @@ from typing import Any, Dict, Optional, Tuple, Union
 Parameters = Dict[str, Any]
 
 
+def _sink_destination(value: Any) -> Any:
+    """
+    Unwrap QGIS output destinations to a path / TEMPORARY_OUTPUT / memory URI.
+
+    In the Processing Toolbox, FeatureSink values are often
+    ``QgsProcessingOutputLayerDefinition`` objects. ``str(definition)`` is
+    *not* a filesystem path and must not be passed to ``Path`` / ``mkdir``.
+    """
+    if value is None:
+        return None
+
+    type_name = type(value).__name__
+    if type_name == "QgsProcessingOutputLayerDefinition" or (
+        hasattr(value, "sink") and "OutputLayerDefinition" in type_name
+    ):
+        value = getattr(value, "sink", value)
+
+    # QgsProperty sometimes wraps the sink string.
+    if type(value).__name__ == "QgsProperty":
+        try:
+            value = value.valueAsString()
+        except Exception:
+            try:
+                value = value.value()
+            except Exception:
+                pass
+
+    return value
+
+
 def _as_path(value: Any) -> Optional[Path]:
+    value = _sink_destination(value)
     if value is None:
         return None
     if isinstance(value, Path):
@@ -30,6 +61,9 @@ def _as_path(value: Any) -> Optional[Path]:
     else:
         text = str(value).strip()
     if not text:
+        return None
+    # Never treat the definition repr as a path.
+    if "QgsProcessingOutputLayerDefinition" in text:
         return None
     # Memory / temporary Processing destinations — not filesystem paths.
     lower = text.lower()
@@ -46,8 +80,38 @@ def _as_path(value: Any) -> Optional[Path]:
 
 
 def partial_path_for(final: Path) -> Path:
-    """Sibling path used while writing (file or directory)."""
+    """
+    Sibling path used while writing (file or directory).
+
+    For files with a suffix, insert ``.partial`` *before* the extension
+    (``out.gpkg`` → ``out.partial.gpkg``). OGR/GeoPackage often appends the
+    driver extension to the given path; writing to ``out.gpkg.partial`` would
+    create ``out.gpkg.partial.gpkg`` and break finalize.
+    """
+    if final.suffix:
+        return final.with_name(final.stem + ".partial" + final.suffix)
     return final.with_name(final.name + ".partial")
+
+
+def _existing_temp_candidates(temp: Path, final: Path) -> list[Path]:
+    """Paths that may hold the written partial (legacy + current layouts)."""
+    cands = [temp]
+    # Legacy: final=out.gpkg → temp was out.gpkg.partial, OGR wrote out.gpkg.partial.gpkg
+    if final.suffix:
+        legacy = final.with_name(final.name + ".partial")
+        cands.append(legacy)
+        cands.append(Path(str(legacy) + final.suffix))
+        cands.append(Path(str(temp) + final.suffix))
+    # De-dupe while preserving order
+    seen = set()
+    out: list[Path] = []
+    for p in cands:
+        key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
 
 
 @dataclass
@@ -58,6 +122,14 @@ class AtomicOutput:
     temp: Path
     is_dir: bool = False
     _done: bool = False
+
+    def _resolve_temp(self) -> Path:
+        if self.is_dir:
+            return self.temp
+        for cand in _existing_temp_candidates(self.temp, self.final):
+            if cand.is_file():
+                return cand
+        return self.temp
 
     def finalize(self) -> Path:
         if self._done:
@@ -70,18 +142,19 @@ class AtomicOutput:
             # replace() works for dirs on Windows only when dest absent
             os.rename(str(self.temp), str(self.final))
         else:
-            # Retry briefly — GeoPackage may still be flushing.
-            last_exc: Optional[BaseException] = None
-            for _ in range(10):
-                try:
-                    os.replace(str(self.temp), str(self.final))
-                    last_exc = None
-                    break
-                except PermissionError as exc:
-                    last_exc = exc
-                    time.sleep(0.15)
-            if last_exc is not None:
-                raise last_exc
+            written = self._resolve_temp()
+            if not written.is_file():
+                raise FileNotFoundError(
+                    f"Atomic partial missing (looked for {self.temp} and variants)"
+                )
+            _publish_file_with_retries(written, self.final)
+            # Clean any leftover sibling partials from alternate naming.
+            for cand in _existing_temp_candidates(self.temp, self.final):
+                if cand != self.final and cand.is_file():
+                    try:
+                        cand.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         self._done = True
         return self.final
 
@@ -93,16 +166,53 @@ class AtomicOutput:
                 if self.temp.is_dir():
                     shutil.rmtree(self.temp, ignore_errors=True)
             else:
-                if self.temp.is_file():
-                    self.temp.unlink(missing_ok=True)
-                # Sidecar leftovers (rare)
-                for side in self.temp.parent.glob(self.temp.name + ".*"):
+                for cand in _existing_temp_candidates(self.temp, self.final):
                     try:
-                        side.unlink(missing_ok=True)
+                        if cand.is_file():
+                            cand.unlink(missing_ok=True)
+                        for side in cand.parent.glob(cand.name + ".*"):
+                            try:
+                                side.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                     except OSError:
                         pass
         finally:
             self._done = True
+
+
+def _is_sqlite_container(path: Path) -> bool:
+    return path.suffix.lower() in {".gpkg", ".sqlite", ".db"}
+
+
+def _remove_vector_path(path: Path) -> None:
+    """Delete a vector file and common sidecars (shapefile / gpkg rtree)."""
+    if path.suffix.lower() == ".shp":
+        stem = path.with_suffix("")
+        for ext in (
+            ".shp",
+            ".shx",
+            ".dbf",
+            ".prj",
+            ".cpg",
+            ".qpj",
+            ".sbn",
+            ".sbx",
+        ):
+            try:
+                stem.with_suffix(ext).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    for side in path.parent.glob(path.name + ".*"):
+        try:
+            side.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def begin_atomic_file_output(
@@ -114,17 +224,34 @@ def begin_atomic_file_output(
 
     Returns updated parameters (copy) and an AtomicOutput handle, or
     (original parameters, None) when OUTPUT is not a plain file path.
+
+    Shapefile outputs skip atomic rename: OGR writes several sidecars, and
+    FeatureSink keeps handles open that block a clean multi-file rename.
     """
     final = _as_path(parameters.get(key))
     if final is None:
+        # Temporary / memory / unrecognized — leave QGIS destination as-is.
         return parameters, None
 
+    # Shapefile: write directly to the final path (multi-file format).
+    # Normalize to a plain path string so parameterAsSink never sees a
+    # QgsProcessingOutputLayerDefinition repr.
+    if final.suffix.lower() == ".shp":
+        _remove_vector_path(final)
+        for cand in _existing_temp_candidates(partial_path_for(final), final):
+            _remove_vector_path(cand)
+        new_params = dict(parameters)
+        new_params[key] = str(final)
+        return new_params, None
+
     temp = partial_path_for(final)
-    if temp.exists():
-        if temp.is_dir():
-            shutil.rmtree(temp, ignore_errors=True)
-        else:
-            temp.unlink(missing_ok=True)
+    # Remove any leftover partials from current or legacy naming.
+    for cand in _existing_temp_candidates(temp, final):
+        if cand.exists():
+            if cand.is_dir():
+                shutil.rmtree(cand, ignore_errors=True)
+            else:
+                _remove_vector_path(cand)
 
     temp.parent.mkdir(parents=True, exist_ok=True)
     new_params = dict(parameters)
@@ -153,23 +280,141 @@ def begin_atomic_dir_output(
     return AtomicOutput(final=final, temp=temp, is_dir=True)
 
 
+def _release_dest_layer(context: Any, dest_id: Any) -> None:
+    """
+    Drop Processing's open output layer so Windows can rename the GeoPackage.
+
+    ``parameterAsSink`` keeps a QgsVectorLayer on the partial path (plus an
+    SQLite rtree sidecar). Renaming while that layer is alive → WinError 32.
+    """
+    if context is None or dest_id is None:
+        return
+    dest_id = str(dest_id)
+    try:
+        details = context.layersToLoadOnCompletion()
+        if isinstance(details, dict) and dest_id in details:
+            details.pop(dest_id, None)
+    except Exception:
+        pass
+    try:
+        store = context.temporaryLayerStore()
+    except Exception:
+        store = None
+    if store is None:
+        return
+    try:
+        layer = store.mapLayer(dest_id)
+        if layer is not None:
+            store.removeMapLayer(dest_id)
+    except Exception:
+        pass
+
+
+def _flush_gpkg_handles(path: Path) -> None:
+    """Best-effort GDAL flush if the file is still in the GDAL cache."""
+    try:
+        from osgeo import gdal
+
+        ds = gdal.OpenEx(str(path), gdal.OF_UPDATE | gdal.OF_VECTOR)
+        if ds is not None:
+            ds.FlushCache()
+            ds = None
+    except Exception:
+        pass
+
+
+def _sqlite_backup_publish(written: Path, final: Path) -> None:
+    """Safe publish for GeoPackage: SQLite online backup (not byte-copy)."""
+    import sqlite3
+
+    if final.exists():
+        final.unlink()
+    src = sqlite3.connect(str(written))
+    try:
+        dst = sqlite3.connect(str(final))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    check = sqlite3.connect(str(final))
+    try:
+        row = check.execute("PRAGMA integrity_check").fetchone()
+        if not row or row[0] != "ok":
+            raise RuntimeError(f"Published GeoPackage failed integrity_check: {row}")
+    finally:
+        check.close()
+    try:
+        written.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _publish_file_with_retries(written: Path, final: Path) -> None:
+    """Rename partial → final. Never byte-copy a live GeoPackage/SQLite DB."""
+    import gc
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(60):
+        try:
+            os.replace(str(written), str(final))
+            return
+        except OSError as exc:
+            winerr = getattr(exc, "winerror", None)
+            locked = (
+                isinstance(exc, PermissionError)
+                or winerr == 32
+                or "being used" in str(exc).lower()
+            )
+            if not locked:
+                raise
+            last_exc = exc
+            if attempt == 0:
+                _flush_gpkg_handles(written)
+            if attempt in (5, 15, 30):
+                gc.collect()
+            # Byte-copy of a locked GeoPackage corrupts SQLite (invalid rootpage).
+            # Use the SQLite backup API once the DB is readable.
+            if attempt >= 10 and _is_sqlite_container(written):
+                try:
+                    _sqlite_backup_publish(written, final)
+                    return
+                except Exception as backup_exc:
+                    last_exc = backup_exc
+            time.sleep(0.2 if attempt < 20 else 0.4)
+    if last_exc is not None:
+        raise last_exc
+    raise PermissionError(f"Could not publish {written} → {final}")
+
 def finish_or_abandon(
     handle: Optional[AtomicOutput],
     *,
     ok: bool,
     sink: Any = None,
+    context: Any = None,
+    dest_id: Any = None,
 ) -> Optional[str]:
     """
-    Close sink (if given), then finalize or abandon.
+    Close sink / dest layer, then finalize or abandon.
 
     Returns the final path string when ok and handle was used.
+    Pass ``context`` + ``dest_id`` from ``parameterAsSink`` so GeoPackage
+    locks are released before rename (required on Windows).
     """
-    # Drop sink so Windows releases the GeoPackage lock.
+    import gc
+
+    # Drop sink so Windows releases the GeoPackage / SQLite lock.
     if sink is not None:
         try:
             del sink
         except Exception:
             pass
+        sink = None
+    _release_dest_layer(context, dest_id)
+    gc.collect()
+    # GeoPackage / rtree often keep a short-lived lock after close.
+    time.sleep(0.5)
 
     if handle is None:
         return None

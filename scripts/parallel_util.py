@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Callable, Iterable, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Callable, List, Optional, Sequence
 
 
 def resolve_workers(requested: int, cap: int = 8) -> int:
@@ -21,11 +24,52 @@ def resolve_workers(requested: int, cap: int = 8) -> int:
     return max(1, n)
 
 
+def ensure_worker_python() -> Optional[str]:
+    """
+    Make ProcessPoolExecutor spawn real ``python.exe``.
+
+    When algorithms run under ``qgis_process.exe``, ``sys.executable`` is that
+    binary. Workers then get launched as ``qgis_process.exe -c ...``, which
+    fails with ``Command -c not known!``. Point multiprocessing at the QGIS
+    ``python.exe`` instead.
+    """
+    exe = Path(sys.executable).resolve() if sys.executable else None
+    if exe is not None and "python" in exe.name.lower() and exe.is_file():
+        return str(exe)
+
+    candidates: List[Path] = []
+    if exe is not None:
+        bin_dir = exe.parent
+        candidates.append(bin_dir / "python.exe")
+        # qgis_process lives in apps/qgis-ltr/bin on some installs.
+        for up in (bin_dir, bin_dir.parent, bin_dir.parent.parent, bin_dir.parent.parent.parent):
+            candidates.append(up / "bin" / "python.exe")
+            candidates.extend(sorted(up.glob("apps/Python*/python.exe")))
+
+    prog = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    if prog.is_dir():
+        for qgis_dir in sorted(prog.glob("QGIS*"), reverse=True):
+            candidates.append(qgis_dir / "bin" / "python.exe")
+            candidates.extend(sorted(qgis_dir.glob("apps/Python*/python.exe")))
+
+    seen = set()
+    for cand in candidates:
+        try:
+            key = str(cand.resolve()).lower()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand.is_file():
+            mp.set_executable(str(cand))
+            return str(cand)
+    return None
+
+
 def _pool_initializer(scripts_root: Optional[str]) -> None:
     if not scripts_root:
         return
-    import sys
-
     if scripts_root not in sys.path:
         sys.path.insert(0, scripts_root)
 
@@ -64,6 +108,29 @@ def map_in_processes(
                         f"{progress_label}: {i + 1}/{n}"
                     )
         return out
+
+    worker_py = ensure_worker_python()
+    if not worker_py:
+        if feedback is not None and hasattr(feedback, "pushWarning"):
+            feedback.pushWarning(
+                "Could not locate python.exe for worker processes; "
+                "falling back to serial execution."
+            )
+        elif feedback is not None and hasattr(feedback, "pushInfo"):
+            feedback.pushInfo(
+                "No worker python.exe found — running serially."
+            )
+        return map_in_processes(
+            fn,
+            tasks,
+            workers=1,
+            scripts_root=scripts_root,
+            feedback=feedback,
+            progress_label=progress_label,
+        )
+
+    if feedback is not None and hasattr(feedback, "pushInfo"):
+        feedback.pushInfo(f"Worker interpreter: {worker_py}")
 
     results: List[Optional[Any]] = [None] * len(tasks)
     done = 0

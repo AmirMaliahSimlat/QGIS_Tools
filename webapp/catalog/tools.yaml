@@ -87,17 +87,12 @@ tools:
     algorithm: script:tree_mask_to_points
     display_name: Tree mask polygons to spaced points
     tabs: [trees]
-    description: Place spaced PointZ samples inside tree footprints, clearing buildings.
+    description: Place spaced PointZ samples inside tree footprints.
     params:
       - id: INPUT_POLYGONS
         label: Tree footprints
         type: vector_file
         library: trees_footprints
-        required: true
-      - id: INPUT_BUILDINGS
-        label: Buildings footprints
-        type: vector_file
-        library: buildings_footprints
         required: true
       - id: INPUT_MESH
         label: Quantized-mesh (highest LOD)
@@ -110,11 +105,6 @@ tools:
         type: number
         default: 1.5
         min: 0.01
-      - id: BUILDING_CLEARANCE
-        label: Clearance from buildings (m)
-        type: number
-        default: 1.0
-        min: 0.0
       - id: WORKERS
         label: Worker processes (0=auto, 1=serial)
         type: integer
@@ -125,7 +115,7 @@ tools:
         type: vector_output
         domain: trees_points
         default_tier: working
-        default_name: tree_points.gpkg
+        default_name: tree_points.shp
         required: true
 
   - id: thin_tree_points
@@ -154,7 +144,7 @@ tools:
         type: vector_output
         domain: trees_points
         default_tier: working
-        default_name: tree_points_thinned.gpkg
+        default_name: tree_points_thinned.shp
         required: true
 
   - id: sample_tree_rgb
@@ -178,7 +168,7 @@ tools:
         type: vector_output
         domain: trees_points
         default_tier: working
-        default_name: tree_points_rgb.gpkg
+        default_name: tree_points_rgb.shp
         required: true
 
   - id: building_altitude_and_height
@@ -220,7 +210,7 @@ tools:
         type: vector_output
         domain: buildings_footprints
         default_tier: working
-        default_name: buildings_altitude.gpkg
+        default_name: buildings_altitude.shp
         required: true
 
   - id: assign_roof_type
@@ -248,7 +238,7 @@ tools:
         type: vector_output
         domain: buildings_footprints
         default_tier: working
-        default_name: buildings_roof_type.gpkg
+        default_name: buildings_roof_type.shp
         required: true
 
   - id: polygon_mask_points
@@ -297,7 +287,7 @@ tools:
         type: vector_output
         domain: roads_outline_points
         default_tier: working
-        default_name: road_outline_points.gpkg
+        default_name: road_outline_points.shp
         required: true
 
   - id: flatten_road_mesh
@@ -399,15 +389,61 @@ tools:
         type: vector_output
         domain: water_footprints
         default_tier: working
-        default_name: water_altitude.gpkg
+        default_name: water_altitude.shp
         required: true
 
   - id: layers_alignment
+    algorithm: script:layers_alignment
     display_name: Layers alignment
     tabs: [common]
-    placeholder: true
     description: >
-      Coming soon — remove overlaps by priority (roads → water → buildings → trees):
-      drop trees on buildings/roads/water, buildings on roads/water, and water on roads.
-      (Trees may be masks or points; TBD when implemented.)
-    params: []
+      Remove overlaps by priority (roads → water → buildings → trees):
+      cut water on roads, buildings on roads/water, and trees on roads/water/buildings.
+      Trees may be footprints or points. Roads are unchanged.
+    params:
+      - id: INPUT_ROADS
+        label: Roads masks
+        type: vector_file
+        library: roads_masks
+        required: true
+      - id: INPUT_WATER
+        label: Water footprints
+        type: vector_file
+        library: water_footprints
+        required: true
+      - id: INPUT_BUILDINGS
+        label: Buildings footprints
+        type: vector_file
+        library: buildings_footprints
+        required: true
+      - id: INPUT_TREES
+        label: Trees (footprints or points)
+        type: vector_file
+        library: trees_footprints
+        required: true
+      - id: CLEARANCE
+        label: Clearance buffer (m)
+        type: number
+        default: 1.0
+        min: 0.0
+      - id: OUTPUT_WATER
+        label: Aligned water
+        type: vector_output
+        domain: water_footprints
+        default_tier: working
+        default_name: water_aligned.shp
+        required: true
+      - id: OUTPUT_BUILDINGS
+        label: Aligned buildings
+        type: vector_output
+        domain: buildings_footprints
+        default_tier: working
+        default_name: buildings_aligned.shp
+        required: true
+      - id: OUTPUT_TREES
+        label: Aligned trees
+        type: vector_output
+        domain: trees_footprints
+        default_tier: working
+        default_name: trees_aligned.shp
+        required: true

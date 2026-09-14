@@ -41,6 +41,14 @@ _STAGE_HINT = re.compile(
     r"worker|tile|mesh|polygon|point|centroid"
     r")\b"
 )
+# Python warnings / code frames must never become the live stage label.
+_IGNORE_STAGE = re.compile(
+    r"(?i)("
+    r"DeprecationWarning|UserWarning|FutureWarning|Traceback|"
+    r"File \".+\.py\"|constructor is deprecated|"
+    r"^\s*fields\.append|^\s*from |^\s*import "
+    r")"
+)
 
 # Don't spam the console with every pushInfo; keep stage text fresh.
 _LOG_MIN_INTERVAL_S = 2.5
@@ -310,6 +318,11 @@ class _StreamProgress:
         self._update_pct_from_partial(line)
         stripped = self._clean_stage_line(line)
         if not stripped:
+            return
+        if _IGNORE_STAGE.search(stripped) or ".py:" in stripped:
+            # Still surface real failures; skip noisy warning frames as stage.
+            if _IMPORTANT_LOG.search(stripped) and "deprecated" not in stripped.lower():
+                self._log_line(stripped, force=True)
             return
         if _PROGRESS_DONE.search(stripped):
             self.job_pct = 100.0

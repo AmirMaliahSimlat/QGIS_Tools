@@ -13,7 +13,7 @@ CATALOG_PATH = Path(__file__).resolve().parent / "catalog" / "tools.yaml"
 DEFAULT_DATABASE = REPO_ROOT / "Database"
 
 VECTOR_EXTS = {".shp", ".gpkg", ".geojson", ".json", ".gml"}
-VECTOR_OUTPUT_EXT = ".gpkg"
+VECTOR_OUTPUT_EXT = ".shp"
 OUTPUT_TIERS = ("working", "tests")
 ALL_TIERS = ("source", "working", "tests")
 INPUT_TIERS = ("working", "source", "tests")
@@ -392,7 +392,7 @@ def finalize_output_filename(param: Dict[str, Any], name: str) -> str:
     """
     Turn a user-facing name (no type) into the on-disk file/folder name.
 
-    vector_output → always .gpkg; folder_output → bare folder name.
+    vector_output → always .shp; folder_output → bare folder name.
     """
     stem = output_name_stem(name)
     if not stem:
@@ -416,7 +416,7 @@ def resolve_output_path(
     param: Dict[str, Any],
     spec: Any,
 ) -> str:
-    """Turn {tier, name} into Database/<map>/<domain>/<tier>/<name[.gpkg]>."""
+    """Turn {tier, name} into Database/<map>/<domain>/<tier>/<name[.shp]>."""
     domain_key = param.get("domain") or param.get("library") or "outputs"
     if isinstance(spec, dict):
         tier = str(spec.get("tier") or "working")

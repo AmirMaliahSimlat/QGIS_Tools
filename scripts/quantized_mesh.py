@@ -474,9 +474,10 @@ def sample_lonlats_parallel(
             feedback.pushInfo(f"Using 1 worker process (mesh sample).")
         return sample_lonlats_batch(mesh_folder, lonlats, level=level)
 
-    # Chunk by worker count (aim ~equal sizes, min 32 pts/chunk).
+    # More, smaller chunks → steadier progress and lower per-worker RAM.
     n = len(lonlats)
-    chunk_size = max(32, (n + n_workers - 1) // n_workers)
+    target_chunks = max(n_workers * 4, n_workers)
+    chunk_size = max(32, min(50_000, (n + target_chunks - 1) // target_chunks))
     chunks: List[List[Tuple[float, float]]] = [
         lonlats[i : i + chunk_size] for i in range(0, n, chunk_size)
     ]
@@ -484,7 +485,7 @@ def sample_lonlats_parallel(
     if feedback is not None and hasattr(feedback, "pushInfo"):
         feedback.pushInfo(
             f"Using {n_workers} worker processes "
-            f"({len(chunks)} mesh-sample chunks)."
+            f"({len(chunks)} mesh-sample chunks × ~{chunk_size} pts)."
         )
     parts = map_in_processes(
         _sample_lonlats_chunk,

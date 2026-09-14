@@ -307,7 +307,9 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
             feedback.setProgress(int(100.0 * current / total))
 
         ok = not canceled
-        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        published = finish_or_abandon(
+            atomic, ok=ok, sink=sink, context=context, dest_id=dest_id
+        )
         sink = None
         if canceled:
             raise QgsProcessingException(self.tr("Canceled."))

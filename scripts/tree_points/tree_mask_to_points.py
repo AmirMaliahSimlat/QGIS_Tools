@@ -10,7 +10,7 @@ tileset into a hardcoded ``altitude`` attribute (and PointZ Z).
 Packing notes:
 - Multipart features are packed per-part (each part's own bbox) so empty
   space between parts is not scanned.
-- Uses prepared GEOS engines for fast point-in-polygon / building tests.
+- Uses prepared GEOS engines for fast point-in-polygon tests.
 - Primary hex phase only; half-offset fill phases run only when a feature
   still has zero points (centroid fallback remains as last resort).
 """
@@ -20,7 +20,7 @@ import os
 import sys
 import time
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -39,8 +39,6 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
     QgsProject,
-    QgsRectangle,
-    QgsSpatialIndex,
     QgsWkbTypes,
 )
 
@@ -61,10 +59,8 @@ ALTITUDE_FIELD = "altitude"
 
 class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_POLYGONS = "INPUT_POLYGONS"
-    INPUT_BUILDINGS = "INPUT_BUILDINGS"
     INPUT_MESH = "INPUT_MESH"
     MIN_DISTANCE = "MIN_DISTANCE"
-    BUILDING_CLEARANCE = "BUILDING_CLEARANCE"
     WORKERS = "WORKERS"
     OUTPUT = "OUTPUT"
 
@@ -94,9 +90,8 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             "so no two accepted points are closer than the chosen distance. "
             "Polygons that receive no lattice point get their centroid if it "
             "still respects the spacing.\n\n"
-            "A buildings polygon layer is required: no tree is placed inside "
-            "a footprint or within the building-clearance distance (default "
-            "1 m).\n\n"
+            "Use Layers alignment beforehand if trees must be cleared from "
+            "buildings, roads, or water.\n\n"
             f"Each output point is PointZ with attribute '{ALTITUDE_FIELD}' "
             "sampled from the quantized-mesh tileset at that location."
         )
@@ -106,13 +101,6 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterVectorLayer(
                 self.INPUT_POLYGONS,
                 self.tr("Tree mask polygons"),
-                [QgsProcessing.TypeVectorPolygon],
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterVectorLayer(
-                self.INPUT_BUILDINGS,
-                self.tr("Buildings footprints"),
                 [QgsProcessing.TypeVectorPolygon],
             )
         )
@@ -130,15 +118,6 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=1.5,
                 minValue=0.01,
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.BUILDING_CLEARANCE,
-                self.tr("Clearance from buildings (meters)"),
-                type=QgsProcessingParameterNumber.Double,
-                defaultValue=1.0,
-                minValue=0.0,
             )
         )
         self.addParameter(
@@ -163,22 +142,14 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         layer = self.parameterAsVectorLayer(
             parameters, self.INPUT_POLYGONS, context
         )
-        buildings = self.parameterAsVectorLayer(
-            parameters, self.INPUT_BUILDINGS, context
-        )
         mesh_folder = self.parameterAsFile(parameters, self.INPUT_MESH, context)
         min_dist = self.parameterAsDouble(
             parameters, self.MIN_DISTANCE, context
-        )
-        clearance = self.parameterAsDouble(
-            parameters, self.BUILDING_CLEARANCE, context
         )
         workers_req = self.parameterAsInt(parameters, self.WORKERS, context)
 
         if layer is None:
             raise QgsProcessingException(self.tr("Invalid polygon layer."))
-        if buildings is None:
-            raise QgsProcessingException(self.tr("Invalid buildings layer."))
         if not mesh_folder or not os.path.isdir(mesh_folder):
             raise QgsProcessingException(
                 self.tr("Invalid quantized-mesh tiles folder.")
@@ -186,10 +157,6 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         if min_dist <= 0:
             raise QgsProcessingException(
                 self.tr("Minimum distance must be > 0.")
-            )
-        if clearance < 0:
-            raise QgsProcessingException(
-                self.tr("Building clearance must be ≥ 0.")
             )
 
         source_crs = layer.sourceCrs()
@@ -239,24 +206,12 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        feedback.setProgressText(self.tr("Indexing buildings…"))
-        bldg_index, bldg_engines, n_bldg = self._index_buildings(
-            buildings, metric_crs, clearance, feedback
-        )
-        if feedback.isCanceled():
-            canceled = True
-        feedback.pushInfo(
-            self.tr(
-                f"Excluding {n_bldg} buildings with {clearance} m clearance."
-            )
-        )
-
         # Pack in a true meter CRS. Prefer the layer CRS when it is already
         # projected metres; otherwise use the local UTM zone.
         dx = min_dist
         dy = min_dist * math.sqrt(3.0) / 2.0
         # Primary hex lattice already enforces ≥ min_dist between neighbors.
-        # Extra half-offset phases only fill holes left by PIP/building rejects;
+        # Extra half-offset phases only fill holes left by PIP rejects;
         # run them only when a feature still has zero points.
         primary_phases = ((0.0, 0.0),)
         fill_phases = (
@@ -339,10 +294,6 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                             if not engine.intersects(QgsPoint(x, y)):
                                 continue
                             xy = (x, y)
-                            if self._blocked_by_building(
-                                xy, bldg_index, bldg_engines
-                            ):
-                                continue
                             if not self._far_enough_grid(
                                 xy, grid, cell, min_dist_sq
                             ):
@@ -398,14 +349,22 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                     continue
             if not self._far_enough_grid(cxy, grid, cell, min_dist_sq):
                 continue
-            if self._blocked_by_building(cxy, bldg_index, bldg_engines):
-                continue
             accepted_metric.append(cxy)
             self._grid_insert(grid, cell, cxy)
 
         # Final enforcement pass (drop any pair that still violates min_dist).
+        feedback.setProgressText(
+            self.tr(
+                f"Enforcing min spacing on {len(accepted_metric)} points..."
+            )
+        )
+        feedback.pushInfo(
+            self.tr(
+                f"Enforcing ≥ {min_dist} m spacing on {len(accepted_metric)} points…"
+            )
+        )
         accepted_metric, dropped = self._enforce_min_distance(
-            accepted_metric, min_dist
+            accepted_metric, min_dist, feedback=feedback
         )
         if dropped:
             feedback.pushWarning(
@@ -415,25 +374,36 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                 )
             )
 
-        nn = self._min_nearest_neighbor(accepted_metric)
-        if nn is not None:
+        if len(accepted_metric) <= 100_000:
+            feedback.setProgressText(self.tr("Checking nearest-neighbor spacing..."))
+            nn = self._min_nearest_neighbor(accepted_metric)
+            if nn is not None:
+                feedback.pushInfo(
+                    self.tr(
+                        f"Measured min nearest-neighbor distance: {nn:.3f} m "
+                        f"(requested ≥ {min_dist} m) in {metric_crs.authid()}."
+                    )
+                )
+            if nn is not None and nn < min_dist - 1e-3:
+                raise QgsProcessingException(
+                    self.tr(
+                        f"Internal spacing error: nearest points are {nn:.3f} m "
+                        f"apart but minimum was {min_dist} m."
+                    )
+                )
+        else:
             feedback.pushInfo(
                 self.tr(
-                    f"Measured min nearest-neighbor distance: {nn:.3f} m "
-                    f"(requested ≥ {min_dist} m) in {metric_crs.authid()}."
-                )
-            )
-        if nn is not None and nn < min_dist - 1e-3:
-            raise QgsProcessingException(
-                self.tr(
-                    f"Internal spacing error: nearest points are {nn:.3f} m "
-                    f"apart but minimum was {min_dist} m."
+                    f"Skipping full nearest-neighbor scan for "
+                    f"{len(accepted_metric)} points (too large); "
+                    f"spacing already enforced by grid."
                 )
             )
 
         fields = QgsFields()
-        fields.append(QgsField(ALTITUDE_FIELD, QVariant.Double))
+        fields.append(QgsField(ALTITUDE_FIELD, QMetaType.Type.Double))
 
+        feedback.setProgressText(self.tr("Creating output layer..."))
         sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
             sink_params,
@@ -454,7 +424,9 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             self.tr(f"Sampling altitudes for {total_out} points…")
         )
-        feedback.setProgressText(self.tr("Opening quantized-mesh…"))
+        feedback.setProgressText(
+            self.tr(f"Opening quantized-mesh for {total_out} points...")
+        )
         try:
             sampler = QuantizedMeshSampler(mesh_folder)
         except Exception as exc:
@@ -519,7 +491,9 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             written += 1
 
         ok = not canceled
-        published = finish_or_abandon(atomic, ok=ok, sink=sink)
+        published = finish_or_abandon(
+            atomic, ok=ok, sink=sink, context=context, dest_id=dest_id
+        )
         sink = None
         if canceled:
             raise QgsProcessingException(self.tr("Canceled."))
@@ -603,56 +577,6 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             return None
 
     @staticmethod
-    def _index_buildings(buildings, metric_crs, clearance, feedback):
-        """Buffered buildings in metric CRS + spatial index + prepared engines."""
-        to_metric = QgsCoordinateTransform(
-            buildings.sourceCrs(), metric_crs, QgsProject.instance()
-        )
-        index = QgsSpatialIndex()
-        engines = {}
-        n = 0
-        for feat in buildings.getFeatures():
-            if feedback.isCanceled():
-                break
-            geom = feat.geometry()
-            if geom is None or geom.isEmpty():
-                continue
-            metric_geom = QgsGeometry(geom)
-            if metric_geom.transform(to_metric) != 0:
-                continue
-            metric_geom = metric_geom.makeValid()
-            if metric_geom.isEmpty():
-                continue
-            if clearance > 0:
-                buffered = metric_geom.buffer(clearance, 5)
-                if buffered is None or buffered.isEmpty():
-                    buffered = metric_geom
-                metric_geom = buffered
-            stored = QgsFeature(n)
-            stored.setGeometry(metric_geom)
-            engine = TreeMaskToPointsAlgorithm._prepare_engine(metric_geom)
-            if engine is None:
-                continue
-            engines[n] = engine
-            index.addFeature(stored)
-            n += 1
-        return index, engines, n
-
-    @staticmethod
-    def _blocked_by_building(xy, index, engines):
-        if not engines:
-            return False
-        x, y = xy
-        # Degenerate point bbox for the spatial index query.
-        rect = QgsRectangle(x, y, x, y)
-        pt = QgsPoint(x, y)
-        for fid in index.intersects(rect):
-            eng = engines.get(fid)
-            if eng is not None and eng.intersects(pt):
-                return True
-        return False
-
-    @staticmethod
     def _hex_points_xy(bbox, dx, dy, phase_x=0.0, phase_y=0.0):
         """Yield (x, y) hex-lattice points covering bbox (no QgsPointXY alloc)."""
         origin_x = bbox.xMinimum() + phase_x
@@ -701,7 +625,7 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         return True
 
     @staticmethod
-    def _enforce_min_distance(points, min_dist):
+    def _enforce_min_distance(points, min_dist, feedback=None):
         """Keep points in order; drop any that fall within min_dist of a keeper."""
         if not points:
             return points, 0
@@ -710,7 +634,16 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         kept = []
         grid = {}
         dropped = 0
-        for xy in points:
+        n = len(points)
+        report_every = max(1, n // 50)
+        for i, xy in enumerate(points):
+            if feedback is not None and (i % report_every == 0 or i + 1 == n):
+                if feedback.isCanceled():
+                    break
+                feedback.setProgress(92 + int(3.0 * (i + 1) / max(n, 1)))
+                feedback.setProgressText(
+                    f"Enforcing spacing... {i + 1}/{n} points"
+                )
             if TreeMaskToPointsAlgorithm._far_enough_grid(
                 xy, grid, cell, min_dist_sq
             ):

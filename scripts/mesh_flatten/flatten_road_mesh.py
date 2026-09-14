@@ -479,40 +479,73 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                         changed_verts += nverts
             else:
                 from concurrent.futures import ProcessPoolExecutor, as_completed
+                from parallel_util import ensure_worker_python
 
-                n_work = max(len(work), 1)
-                progress.tick(0, n_work, f"0/{len(work)} tiles")
-                with ProcessPoolExecutor(
-                    max_workers=n_workers,
-                    initializer=init_tile_worker,
-                    initargs=(_SCRIPTS_ROOT, snap_data),
-                ) as pool:
-                    futures = {
-                        pool.submit(patch_one_tile, task): task for task in work
-                    }
-                    done = 0
-                    for fut in as_completed(futures):
+                worker_py = ensure_worker_python()
+                if not worker_py:
+                    feedback.pushWarning(
+                        self.tr(
+                            "No python.exe for tile workers; running serially."
+                        )
+                    )
+                    init_tile_worker(_SCRIPTS_ROOT, snap_data)
+                    n_work = max(len(work), 1)
+                    for ti, task in enumerate(work):
                         if feedback.isCanceled():
-                            for f in futures:
-                                f.cancel()
                             break
-                        changed, nverts, err = fut.result()
-                        done += 1
+                        if ti % 25 == 0 or ti + 1 == len(work):
+                            progress.tick(
+                                ti + 1,
+                                n_work,
+                                (
+                                    f"tile {ti + 1}/{len(work)} "
+                                    f"patched={changed_tiles} verts={changed_verts}"
+                                ),
+                            )
+                        changed, nverts, err = patch_one_tile(task)
                         if err:
                             feedback.pushWarning(self.tr(err))
                         if changed:
                             changed_tiles += 1
                             changed_verts += nverts
-                        if done % 10 == 0 or done == len(work):
-                            progress.tick(
-                                done,
-                                n_work,
-                                (
-                                    f"tile {done}/{len(work)} "
-                                    f"patched={changed_tiles} "
-                                    f"verts={changed_verts}"
-                                ),
-                            )
+                else:
+                    feedback.pushInfo(
+                        self.tr(f"Worker interpreter: {worker_py}")
+                    )
+                    n_work = max(len(work), 1)
+                    progress.tick(0, n_work, f"0/{len(work)} tiles")
+                    with ProcessPoolExecutor(
+                        max_workers=n_workers,
+                        initializer=init_tile_worker,
+                        initargs=(_SCRIPTS_ROOT, snap_data),
+                    ) as pool:
+                        futures = {
+                            pool.submit(patch_one_tile, task): task
+                            for task in work
+                        }
+                        done = 0
+                        for fut in as_completed(futures):
+                            if feedback.isCanceled():
+                                for f in futures:
+                                    f.cancel()
+                                break
+                            changed, nverts, err = fut.result()
+                            done += 1
+                            if err:
+                                feedback.pushWarning(self.tr(err))
+                            if changed:
+                                changed_tiles += 1
+                                changed_verts += nverts
+                            if done % 10 == 0 or done == len(work):
+                                progress.tick(
+                                    done,
+                                    n_work,
+                                    (
+                                        f"tile {done}/{len(work)} "
+                                        f"patched={changed_tiles} "
+                                        f"verts={changed_verts}"
+                                    ),
+                                )
 
             if feedback.isCanceled():
                 raise QgsProcessingException(self.tr("Canceled."))
