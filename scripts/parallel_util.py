@@ -8,7 +8,7 @@ import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 
 def resolve_workers(requested: int, cap: int = 8) -> int:
@@ -24,27 +24,57 @@ def resolve_workers(requested: int, cap: int = 8) -> int:
     return max(1, n)
 
 
+def _is_real_python(path: Path) -> bool:
+    """True for a standalone python.exe — not qgis-bin / qgis_process."""
+    try:
+        if not path.is_file():
+            return False
+    except OSError:
+        return False
+    name = path.name.lower()
+    # Never treat the QGIS application as a worker interpreter.
+    if name.startswith("qgis") or name.startswith("qgis-") or "qgis_process" in name:
+        return False
+    return name.startswith("python") and name.endswith(".exe")
+
+
 def ensure_worker_python() -> Optional[str]:
     """
-    Make ProcessPoolExecutor spawn real ``python.exe``.
+    Locate a real ``python.exe`` for ProcessPoolExecutor workers.
 
-    When algorithms run under ``qgis_process.exe``, ``sys.executable`` is that
-    binary. Workers then get launched as ``qgis_process.exe -c ...``, which
-    fails with ``Command -c not known!``. Point multiprocessing at the QGIS
-    ``python.exe`` instead.
+    When algorithms run under ``qgis_process.exe`` or ``qgis-bin.exe``,
+    ``sys.executable`` is that binary. Spawning workers with it either fails
+    (``Command -c not known!``) or opens **empty QGIS windows** that look like
+    missing layers. Point multiprocessing at QGIS's ``python.exe`` instead.
     """
     exe = Path(sys.executable).resolve() if sys.executable else None
-    if exe is not None and "python" in exe.name.lower() and exe.is_file():
+    if exe is not None and _is_real_python(exe):
         return str(exe)
 
     candidates: List[Path] = []
     if exe is not None:
         bin_dir = exe.parent
         candidates.append(bin_dir / "python.exe")
-        # qgis_process lives in apps/qgis-ltr/bin on some installs.
-        for up in (bin_dir, bin_dir.parent, bin_dir.parent.parent, bin_dir.parent.parent.parent):
+        candidates.append(bin_dir / "python3.exe")
+        # qgis_process / qgis-bin live in apps/qgis*/bin or bin/
+        for up in (
+            bin_dir,
+            bin_dir.parent,
+            bin_dir.parent.parent,
+            bin_dir.parent.parent.parent,
+        ):
             candidates.append(up / "bin" / "python.exe")
             candidates.extend(sorted(up.glob("apps/Python*/python.exe")))
+            candidates.extend(sorted(up.glob("apps/Python*/python3.exe")))
+
+    # Explicit QGIS env vars when present
+    for env_key in ("QGIS_PREFIX_PATH", "OSGEO4W_ROOT", "PYTHONHOME"):
+        root = os.environ.get(env_key)
+        if not root:
+            continue
+        root_p = Path(root)
+        candidates.append(root_p / "bin" / "python.exe")
+        candidates.extend(sorted(root_p.glob("apps/Python*/python.exe")))
 
     prog = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
     if prog.is_dir():
@@ -61,10 +91,52 @@ def ensure_worker_python() -> Optional[str]:
         if key in seen:
             continue
         seen.add(key)
-        if cand.is_file():
-            mp.set_executable(str(cand))
-            return str(cand)
+        if _is_real_python(cand):
+            return str(cand.resolve())
     return None
+
+
+def spawn_context_for_workers(
+    feedback=None,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Build a spawn multiprocessing context bound to real ``python.exe``.
+
+    Returns ``(mp_context, python_path)`` or ``(None, None)`` if workers
+    cannot be started safely (caller should run serially).
+    """
+    worker_py = ensure_worker_python()
+    if not worker_py:
+        if feedback is not None and hasattr(feedback, "pushWarning"):
+            feedback.pushWarning(
+                "Could not locate python.exe for worker processes; "
+                "falling back to serial execution. "
+                "(Using qgis-bin/qgis_process as workers opens empty QGIS "
+                "windows and breaks the run.)"
+            )
+        return None, None
+
+    # Bind BOTH the spawn context and the global setter — some Python/QGIS
+    # builds only honour one of them when the parent is not python.exe.
+    try:
+        ctx = mp.get_context("spawn")
+    except ValueError:
+        ctx = mp.get_context()
+    try:
+        ctx.set_executable(worker_py)
+    except Exception:
+        pass
+    try:
+        mp.set_executable(worker_py)
+    except Exception:
+        pass
+
+    if feedback is not None and hasattr(feedback, "pushInfo"):
+        parent = sys.executable or "(unknown)"
+        feedback.pushInfo(
+            f"Worker interpreter: {worker_py} (parent was {parent})"
+        )
+    return ctx, worker_py
 
 
 def _pool_initializer(scripts_root: Optional[str]) -> None:
@@ -87,6 +159,9 @@ def map_in_processes(
 
     When ``workers == 1`` or there is at most one task, runs in-process
     (no pool). Returns results in **task order**.
+
+    Workers never receive QGIS layers — only picklable Python data the parent
+    already extracted (paths, coordinates, snapshots).
     """
     if not tasks:
         return []
@@ -109,17 +184,8 @@ def map_in_processes(
                     )
         return out
 
-    worker_py = ensure_worker_python()
-    if not worker_py:
-        if feedback is not None and hasattr(feedback, "pushWarning"):
-            feedback.pushWarning(
-                "Could not locate python.exe for worker processes; "
-                "falling back to serial execution."
-            )
-        elif feedback is not None and hasattr(feedback, "pushInfo"):
-            feedback.pushInfo(
-                "No worker python.exe found — running serially."
-            )
+    ctx, worker_py = spawn_context_for_workers(feedback=feedback)
+    if not worker_py or ctx is None:
         return map_in_processes(
             fn,
             tasks,
@@ -129,17 +195,21 @@ def map_in_processes(
             progress_label=progress_label,
         )
 
-    if feedback is not None and hasattr(feedback, "pushInfo"):
-        feedback.pushInfo(f"Worker interpreter: {worker_py}")
-
     results: List[Optional[Any]] = [None] * len(tasks)
     done = 0
     n = len(tasks)
-    with ProcessPoolExecutor(
+    pool_kwargs = dict(
         max_workers=workers,
         initializer=_pool_initializer,
         initargs=(scripts_root,),
-    ) as pool:
+    )
+    # mp_context is Python 3.11+ / required so qgis-bin parents don't respawn QGIS.
+    try:
+        pool = ProcessPoolExecutor(mp_context=ctx, **pool_kwargs)
+    except TypeError:
+        pool = ProcessPoolExecutor(**pool_kwargs)
+
+    with pool:
         future_map = {
             pool.submit(fn, task): idx for idx, task in enumerate(tasks)
         }

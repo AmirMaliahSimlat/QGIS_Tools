@@ -479,15 +479,10 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                         changed_verts += nverts
             else:
                 from concurrent.futures import ProcessPoolExecutor, as_completed
-                from parallel_util import ensure_worker_python
+                from parallel_util import spawn_context_for_workers
 
-                worker_py = ensure_worker_python()
-                if not worker_py:
-                    feedback.pushWarning(
-                        self.tr(
-                            "No python.exe for tile workers; running serially."
-                        )
-                    )
+                ctx, worker_py = spawn_context_for_workers(feedback=feedback)
+                if not worker_py or ctx is None:
                     init_tile_worker(_SCRIPTS_ROOT, snap_data)
                     n_work = max(len(work), 1)
                     for ti, task in enumerate(work):
@@ -509,16 +504,20 @@ class FlattenRoadMeshAlgorithm(QgsProcessingAlgorithm):
                             changed_tiles += 1
                             changed_verts += nverts
                 else:
-                    feedback.pushInfo(
-                        self.tr(f"Worker interpreter: {worker_py}")
-                    )
                     n_work = max(len(work), 1)
                     progress.tick(0, n_work, f"0/{len(work)} tiles")
-                    with ProcessPoolExecutor(
+                    pool_kwargs = dict(
                         max_workers=n_workers,
                         initializer=init_tile_worker,
                         initargs=(_SCRIPTS_ROOT, snap_data),
-                    ) as pool:
+                    )
+                    try:
+                        pool = ProcessPoolExecutor(
+                            mp_context=ctx, **pool_kwargs
+                        )
+                    except TypeError:
+                        pool = ProcessPoolExecutor(**pool_kwargs)
+                    with pool:
                         futures = {
                             pool.submit(patch_one_tile, task): task
                             for task in work
