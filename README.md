@@ -4,6 +4,8 @@ Small QGIS Processing tools for GIS workflows.
 
 ```text
 scripts/
+  qgis_processing/       # Flat copies — paste all *.py into QGIS Processing scripts
+  sync_qgis_processing.py# Refresh qgis_processing/ after editing tools
   quantized_mesh.py      # shared Cesium quantized-mesh reader
   parallel_util.py       # process-pool helpers
   mesh_flatten_workers.py# picklable flatten tile workers
@@ -14,9 +16,14 @@ scripts/
   line_of_sight/         # Line-of-Sight checker
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
+  layers_alignment/      # Overlap priority: roads → water → buildings → trees
 webapp/                  # Local browser UI over qgis_process
 Database/                # Named input/output folders for the UI
 ```
+
+**Deploy to QGIS (one paste):** after `git pull`, copy every `*.py` from [`scripts/qgis_processing/`](scripts/qgis_processing/) into  
+`%APPDATA%\QGIS\QGIS3\profiles\default\processing\scripts\`.  
+If you edited tools in their subfolders, run `python scripts/sync_qgis_processing.py` first to refresh that folder.
 
 When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) (and for flatten: `parallel_util.py`, `mesh_flatten_workers.py`) available under the same `scripts/` parent. Shared helpers: [`scripts/crs_util.py`](scripts/crs_util.py), [`scripts/atomic_io.py`](scripts/atomic_io.py).
 
