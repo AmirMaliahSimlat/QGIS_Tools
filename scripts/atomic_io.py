@@ -461,28 +461,36 @@ def finish_or_abandon(
     dest_id: Any = None,
 ) -> Optional[str]:
     """
-    Close sink / dest layer, then finalize or abandon.
+    Close sink, then finalize or abandon.
 
-    Returns the final path string when ok and handle was used.
-    Pass ``context`` + ``dest_id`` from ``parameterAsSink`` so GeoPackage
-    locks are released before rename (required on Windows).
+    Returns the final path string when ok and an atomic handle was used.
+    When ``handle`` is None (temporary output / shapefile), the Processing
+    ``dest_id`` layer is left alone so QGIS can add it to the project.
+    Pass ``context`` + ``dest_id`` only for atomic GeoPackage renames that
+    need the file unlocked on Windows.
     """
     import gc
 
-    # Drop sink so Windows releases the GeoPackage / SQLite lock.
+    # Drop sink so writers flush / release handles.
     if sink is not None:
         try:
             del sink
         except Exception:
             pass
         sink = None
+
+    if handle is None:
+        # Temporary layer or direct file write — keep dest_id registered for
+        # layersToLoadOnCompletion / temporaryLayerStore.
+        gc.collect()
+        return None
+
+    # Atomic rename: Processing still holds the partial path open via dest_id.
     _release_dest_layer(context, dest_id)
     gc.collect()
     # GeoPackage / rtree often keep a short-lived lock after close.
     time.sleep(0.5)
 
-    if handle is None:
-        return None
     if ok:
         return str(handle.finalize())
     handle.abandon()
