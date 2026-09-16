@@ -40,6 +40,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
     QgsProject,
+    QgsRectangle,
     QgsWkbTypes,
 )
 
@@ -213,9 +214,22 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         spacing = float(min_dist)
         dx = spacing
         dy = spacing * math.sqrt(3.0) / 2.0
-        # One random origin in the hex unit cell (shape matters more than max count).
-        phase_x = random.random() * dx
-        phase_y = random.random() * dy
+        # One random origin in CRS units (absolute), shared by all polygons.
+        union_bb = None
+        for mf in metric_features:
+            bb = mf.geometry().boundingBox()
+            if bb.isEmpty():
+                continue
+            if union_bb is None:
+                union_bb = QgsRectangle(bb)
+            else:
+                union_bb.combineExtentWith(bb)
+        if union_bb is None:
+            raise QgsProcessingException(
+                self.tr("No usable polygon extents for packing.")
+            )
+        phase_x = union_bb.xMinimum() + random.random() * dx
+        phase_y = union_bb.yMinimum() + random.random() * dy
         feedback.pushInfo(
             self.tr(
                 f"Hex lattice: dx={dx:.4f} m, dy={dy:.4f} m "
@@ -224,8 +238,8 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
         accepted_metric = []  # list of (x, y) in metric CRS
-        # Allow tiny float under-shoot so exact hex diagonals are not rejected.
-        min_dist_sq = (min_dist * min_dist) * (1.0 - 1e-12)
+        # Hex diagonals float to ~0.999999*min_dist; never reject those.
+        min_dist_sq = (min_dist * min_dist) * (1.0 - 1e-9)
         cell = min_dist / math.sqrt(2.0)
         grid = {}
         covered_ids = set()
@@ -280,6 +294,8 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                 if engine is None:
                     continue
                 bbox = part.boundingBox()
+                # Pure hex lattice already respects min_dist — no far_enough
+                # during insert (that pass was stripping staggered rows via float).
                 for x, y in self._hex_points_xy(
                     bbox, dx, dy, phase_x, phase_y
                 ):
@@ -294,8 +310,6 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
                     if not self._point_inside(engine, x, y):
                         continue
                     xy = (x, y)
-                    if not self._far_enough_grid(xy, grid, cell, min_dist_sq):
-                        continue
                     accepted_metric.append(xy)
                     self._grid_insert(grid, cell, xy)
                     placed += 1
@@ -349,7 +363,9 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             accepted_metric.append(cxy)
             self._grid_insert(grid, cell, cxy)
 
-        # Final enforcement pass (drop any pair that still violates min_dist).
+        # Final enforcement only needed after centroid fallback (hex lattice is
+        # already ≥ min_dist). Use a float-safe threshold so hex diagonals that
+        # land at 0.999999*min_dist are not stripped back into a square grid.
         feedback.setProgressText(
             self.tr(
                 f"Enforcing min spacing on {len(accepted_metric)} points..."
@@ -588,41 +604,32 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             return False
 
     @staticmethod
-    def _hex_points_xy(bbox, dx, dy, phase_x=0.0, phase_y=0.0):
+    def _hex_points_xy(bbox, dx, dy, origin_x=0.0, origin_y=0.0):
         """
         Yield (x, y) on a horizontal hexagonal lattice covering bbox.
 
-        Even rows at phase origin; odd rows shifted by dx/2. Row pitch is dy
-        (should be dx * √3/2) so nearest neighbors are exactly dx apart.
-        Row parity uses absolute Y so stagger does not depend on bbox origin.
+        ``origin_x`` / ``origin_y`` are absolute CRS coordinates of lattice
+        row 0 / the even-row x baseline. Odd lattice rows (index j) are shifted
+        by dx/2. Row pitch is dy (= dx * √3/2).
         """
-        x_end = bbox.xMaximum() + dx
-        y_end = bbox.yMaximum() + dy
         xmin = bbox.xMinimum() - 1e-9
         xmax = bbox.xMaximum() + 1e-9
         ymin = bbox.yMinimum() - 1e-9
         ymax = bbox.yMaximum() + 1e-9
 
-        # First row index whose Y can touch the bbox.
-        row0 = int(math.floor((ymin - phase_y) / dy)) - 1
-        y = phase_y + row0 * dy
-        row = row0
-        while y <= y_end:
-            # Absolute row parity → consistent stagger across polygons.
-            x_off = 0.0 if (row % 2 == 0) else (0.5 * dx)
-            x = phase_x + x_off
-            # Snap left edge of scan to bbox.
-            if x < xmin:
-                steps = int(math.floor((xmin - x) / dx))
-                x += steps * dx
-                if x < xmin - 1e-12:
-                    x += dx
-            while x <= x_end:
-                if xmin <= x <= xmax and ymin <= y <= ymax:
+        j0 = int(math.floor((ymin - origin_y) / dy)) - 1
+        j1 = int(math.ceil((ymax - origin_y) / dy)) + 1
+        for j in range(j0, j1 + 1):
+            y = origin_y + j * dy
+            if y < ymin or y > ymax:
+                continue
+            x0 = origin_x + (0.5 * dx if (j & 1) else 0.0)
+            i0 = int(math.floor((xmin - x0) / dx)) - 1
+            i1 = int(math.ceil((xmax - x0) / dx)) + 1
+            for i in range(i0, i1 + 1):
+                x = x0 + i * dx
+                if xmin <= x <= xmax:
                     yield (x, y)
-                x += dx
-            y += dy
-            row += 1
 
     @staticmethod
     def _grid_insert(grid, cell, xy):
@@ -653,7 +660,8 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         """Keep points in order; drop any that fall within min_dist of a keeper."""
         if not points:
             return points, 0
-        min_dist_sq = min_dist * min_dist
+        # Float-safe: hex diagonals often land at 0.999999*min_dist.
+        min_dist_sq = (min_dist * min_dist) * (1.0 - 1e-9)
         cell = min_dist / math.sqrt(2.0)
         kept = []
         grid = {}
