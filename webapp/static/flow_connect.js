@@ -214,6 +214,8 @@
   function onPointerDown(ev) {
     const dot = ev.target && ev.target.closest ? ev.target.closest(".qt-port-dot") : null;
     if (!dot) return;
+    // Read-only DAG preview (Configure): no drag wiring.
+    if (dot.closest(".qt-pipe-dag")) return;
     // Outputs only — never start a wire from an input.
     if (dot.dataset.role !== "out") return;
     const root = dot.closest(".qt-flow-canvas");

@@ -242,7 +242,8 @@ webapp\run.bat
 
 Or: `python webapp\app.py` after `pip install -r webapp\requirements.txt`.
 
-Opens **http://127.0.0.1:8080** — pick tools by tab → Order → Configure → Run queue.
+Opens **http://127.0.0.1:8080** — pick tools by tab → Configure → Run queue.
+Connections follow a fixed pipeline (skipped tools bridge only when file types match).
 In the header, set **QGIS** to the install folder (e.g. `C:\Program Files\QGIS 3.44.12`); the app uses `bin\qgis_process-qgis-ltr.bat` under it. Saved per machine.
 Optional: set `QGIS_PROCESS_BAT` in the environment instead.
 

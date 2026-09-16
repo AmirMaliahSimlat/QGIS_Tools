@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Editable run-order graph (DAG) for the configure stage."""
+"""Hardcoded run-order graph (DAG) for the configure / run stages."""
 
 from __future__ import annotations
 
@@ -16,6 +16,28 @@ _COMPAT = {
     "vector_output": frozenset({"vector_file"}),
     "folder_output": frozenset({"folder"}),
 }
+
+# Fixed pipelines. Each node is (tool_id, input_param_or_None).
+# When tools are skipped, we wire the nearest selected upstream producer whose
+# output domain matches the consumer input (no footprint→points jumps).
+_WIRE_CHAINS: Tuple[Tuple[Tuple[str, Optional[str]], ...], ...] = (
+    (
+        ("layers_alignment", None),
+        ("water_outline_points", "INPUT_POLYGONS"),
+    ),
+    (
+        ("layers_alignment", None),
+        ("tree_mask_to_points", "INPUT_POLYGONS"),
+        ("thin_tree_points", "INPUT_POINTS"),
+        ("sample_tree_rgb", "INPUT_POINTS"),
+    ),
+    (
+        ("layers_alignment", None),
+        ("building_altitude_and_height", "INPUT_BUILDINGS"),
+        ("assign_roof_type", "INPUT_BUILDINGS"),
+    ),
+    # polygon_mask_points (roads) stays alone — no chain entry.
+)
 
 
 def output_ports(tool: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -222,17 +244,67 @@ def prune_edges(edges: Iterable[Edge], selected_ids: Set[str]) -> List[Edge]:
     return out
 
 
+def hardcoded_edges(
+    catalog: Dict[str, Any],
+    selected_ids: Set[str],
+) -> List[Edge]:
+    """
+    Build fixed pipeline wires for the current selection.
+
+    For each chain, keep selected tools in order. For every consumer, attach the
+    nearest upstream selected producer with a compatible domain/library type.
+    """
+    selected_ids = set(selected_ids)
+    edges: List[Edge] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+
+    for chain in _WIRE_CHAINS:
+        nodes = [(tid, ip) for tid, ip in chain if tid in selected_ids]
+        if len(nodes) < 2:
+            continue
+        for i, (to_id, to_param) in enumerate(nodes):
+            if not to_param:
+                continue
+            to_tool = tool_by_id(catalog, to_id)
+            in_param = param_by_id(to_tool, to_param) if to_tool else None
+            if not to_tool or in_param is None:
+                continue
+            for j in range(i - 1, -1, -1):
+                from_id, _ = nodes[j]
+                from_tool = tool_by_id(catalog, from_id)
+                if not from_tool:
+                    continue
+                for out_param in output_ports(from_tool):
+                    if not ports_compatible(out_param, in_param):
+                        continue
+                    key = (from_id, out_param["id"], to_id, to_param)
+                    if key in seen:
+                        break
+                    seen.add(key)
+                    edges.append(
+                        {
+                            "from": from_id,
+                            "from_param": out_param["id"],
+                            "to": to_id,
+                            "to_param": to_param,
+                        }
+                    )
+                    break
+                else:
+                    continue
+                break
+    return edges
+
+
 def sync_flow_edges(
     catalog: Dict[str, Any],
     selected_ids: Set[str],
     edges: List[Edge],
     seeded_tools: Set[str],
 ) -> Tuple[List[Edge], Set[str]]:
-    """Drop edges for deselected tools; do not invent default links."""
+    """Replace user wires with the hardcoded selection-aware graph."""
     selected_ids = set(selected_ids)
-    edges = prune_edges(edges, selected_ids)
-    seeded_tools = set(selected_ids)
-    return edges, seeded_tools
+    return hardcoded_edges(catalog, selected_ids), set(selected_ids)
 
 
 def wires_from_edges(

@@ -11,12 +11,13 @@ Packing notes:
 - Multipart features are packed per-part (each part's own bbox) so empty
   space between parts is not scanned.
 - Uses prepared GEOS engines for fast point-in-polygon tests.
-- Primary hex phase only; half-offset fill phases run only when a feature
-  still has zero points (centroid fallback remains as last resort).
+- Dense hexagonal lattice (odd rows staggered) with one random origin shift.
+- Centroids remain as last resort when a part still has zero points.
 """
 
 import math
 import os
+import random
 import sys
 import time
 
@@ -86,7 +87,7 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         return self.tr(
             "Converts tree-mask polygons (e.g. binary CV footprints) into "
             "points with a guaranteed minimum spacing in meters.\n\n"
-            "Points are generated on a hexagonal lattice covering the masks, "
+            "Points are packed on a dense hexagonal lattice (staggered rows) "
             "so no two accepted points are closer than the chosen distance. "
             "Polygons that receive no lattice point get their centroid if it "
             "still respects the spacing.\n\n"
@@ -206,23 +207,25 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # Pack in a true meter CRS. Prefer the layer CRS when it is already
-        # projected metres; otherwise use the local UTM zone.
-        dx = min_dist
-        dy = min_dist * math.sqrt(3.0) / 2.0
-        # Primary hex lattice already enforces ≥ min_dist between neighbors.
-        # Extra half-offset phases only fill holes left by PIP rejects;
-        # run them only when a feature still has zero points.
-        primary_phases = ((0.0, 0.0),)
-        fill_phases = (
-            (0.5 * dx, 0.0),
-            (0.0, 0.5 * dy),
-            (0.5 * dx, 0.5 * dy),
+        # Dense hexagonal (triangular) packing in meters.
+        # Horizontal neighbor spacing = min_dist; odd rows shift by min_dist/2;
+        # vertical row pitch = min_dist * √3/2 so every neighbor is ≥ min_dist.
+        spacing = float(min_dist)
+        dx = spacing
+        dy = spacing * math.sqrt(3.0) / 2.0
+        # One random origin in the hex unit cell (shape matters more than max count).
+        phase_x = random.random() * dx
+        phase_y = random.random() * dy
+        feedback.pushInfo(
+            self.tr(
+                f"Hex lattice: dx={dx:.4f} m, dy={dy:.4f} m "
+                f"(row stagger={0.5 * dx:.4f} m), "
+                f"origin=({phase_x:.3f}, {phase_y:.3f})."
+            )
         )
         accepted_metric = []  # list of (x, y) in metric CRS
-        min_dist_sq = min_dist * min_dist
-        # Cell smaller than min_dist so a 3x3 neighborhood always covers
-        # any point within min_dist (safe against float edge cases).
+        # Allow tiny float under-shoot so exact hex diagonals are not rejected.
+        min_dist_sq = (min_dist * min_dist) * (1.0 - 1e-12)
         cell = min_dist / math.sqrt(2.0)
         grid = {}
         covered_ids = set()
@@ -270,41 +273,35 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
 
             _report(poly_t0, force=False)
 
-            def _pack_phases(phase_list) -> None:
-                nonlocal placed, probes, canceled
-                for part in parts:
-                    if canceled:
-                        return
-                    engine = self._prepare_engine(part)
-                    if engine is None:
+            for part in parts:
+                if canceled:
+                    break
+                engine = self._prepare_engine(part)
+                if engine is None:
+                    continue
+                bbox = part.boundingBox()
+                for x, y in self._hex_points_xy(
+                    bbox, dx, dy, phase_x, phase_y
+                ):
+                    probes += 1
+                    if probes & 4095 == 0:
+                        now = time.monotonic()
+                        if (now - last_report) >= 1.0:
+                            _report(now, force=True)
+                            if feedback.isCanceled():
+                                canceled = True
+                                break
+                    if not self._point_inside(engine, x, y):
                         continue
-                    bbox = part.boundingBox()
-                    for ox, oy in phase_list:
-                        if canceled:
-                            return
-                        for x, y in self._hex_points_xy(bbox, dx, dy, ox, oy):
-                            probes += 1
-                            now = time.monotonic()
-                            if (now - last_report) >= 1.0:
-                                _report(now, force=True)
-                                if feedback.isCanceled():
-                                    canceled = True
-                                    return
-                            # Prepared GEOS point test — no per-probe QgsGeometry.
-                            if not engine.intersects(QgsPoint(x, y)):
-                                continue
-                            xy = (x, y)
-                            if not self._far_enough_grid(
-                                xy, grid, cell, min_dist_sq
-                            ):
-                                continue
-                            accepted_metric.append(xy)
-                            self._grid_insert(grid, cell, xy)
-                            placed += 1
+                    xy = (x, y)
+                    if not self._far_enough_grid(xy, grid, cell, min_dist_sq):
+                        continue
+                    accepted_metric.append(xy)
+                    self._grid_insert(grid, cell, xy)
+                    placed += 1
+                if canceled:
+                    break
 
-            _pack_phases(primary_phases)
-            if placed == 0 and not canceled:
-                _pack_phases(fill_phases)
             if canceled:
                 break
             if placed:
@@ -577,10 +574,28 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
             return None
 
     @staticmethod
+    def _point_inside(engine, x, y) -> bool:
+        """Prepared GEOS point-in-polygon (prefer contains, fall back intersects)."""
+        pt = QgsPoint(x, y)
+        try:
+            if engine.contains(pt):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(engine.intersects(pt))
+        except Exception:
+            return False
+
+    @staticmethod
     def _hex_points_xy(bbox, dx, dy, phase_x=0.0, phase_y=0.0):
-        """Yield (x, y) hex-lattice points covering bbox (no QgsPointXY alloc)."""
-        origin_x = bbox.xMinimum() + phase_x
-        origin_y = bbox.yMinimum() + phase_y
+        """
+        Yield (x, y) on a horizontal hexagonal lattice covering bbox.
+
+        Even rows at phase origin; odd rows shifted by dx/2. Row pitch is dy
+        (should be dx * √3/2) so nearest neighbors are exactly dx apart.
+        Row parity uses absolute Y so stagger does not depend on bbox origin.
+        """
         x_end = bbox.xMaximum() + dx
         y_end = bbox.yMaximum() + dy
         xmin = bbox.xMinimum() - 1e-9
@@ -588,11 +603,20 @@ class TreeMaskToPointsAlgorithm(QgsProcessingAlgorithm):
         ymin = bbox.yMinimum() - 1e-9
         ymax = bbox.yMaximum() + 1e-9
 
-        row = 0
-        y = origin_y
+        # First row index whose Y can touch the bbox.
+        row0 = int(math.floor((ymin - phase_y) / dy)) - 1
+        y = phase_y + row0 * dy
+        row = row0
         while y <= y_end:
+            # Absolute row parity → consistent stagger across polygons.
             x_off = 0.0 if (row % 2 == 0) else (0.5 * dx)
-            x = origin_x + x_off
+            x = phase_x + x_off
+            # Snap left edge of scan to bbox.
+            if x < xmin:
+                steps = int(math.floor((xmin - x) / dx))
+                x += steps * dx
+                if x < xmin - 1e-12:
+                    x += dx
             while x <= x_end:
                 if xmin <= x <= xmax and ymin <= y <= ymax:
                     yield (x, y)

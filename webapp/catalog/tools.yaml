@@ -69,34 +69,32 @@ tiers: [source, working, tests]
 # Input pickers scan in this order (working = current best). source skipped if N/A.
 input_tiers: [working, source, tests]
 
-# Hardcoded chains: selected tools in a chain run in this order.
-# wire: previous = use the previous *selected* step's primary output as that input.
+# Hardcoded chains (also mirrored in flow_graph._WIRE_CHAINS).
+# Selected tools in a chain run upstream→downstream; skipped tools bridge only
+# when the parent output domain matches the child input library exactly.
 pipelines:
-  - id: trees
-    label: Trees
+  - id: alignment_water
+    label: Layers → Water
     steps:
+      - id: layers_alignment
+      - id: water_outline_points
+  - id: alignment_trees
+    label: Layers → Trees
+    steps:
+      - id: layers_alignment
       - id: tree_mask_to_points
       - id: thin_tree_points
-        wire:
-          INPUT_POINTS: previous
       - id: sample_tree_rgb
-        wire:
-          INPUT_POINTS: previous
-  - id: buildings
-    label: Buildings
+  - id: alignment_buildings
+    label: Layers → Buildings
     steps:
+      - id: layers_alignment
       - id: building_altitude_and_height
       - id: assign_roof_type
-        wire:
-          INPUT_BUILDINGS: previous
   - id: roads
     label: Roads
     steps:
       - id: polygon_mask_points
-  - id: water
-    label: Water
-    steps:
-      - id: water_outline_points
 
 tools:
   - id: tree_mask_to_points
