@@ -8,11 +8,8 @@ scripts/
   sync_qgis_processing.py# Refresh qgis_processing/ after editing tools
   quantized_mesh.py      # shared Cesium quantized-mesh reader
   parallel_util.py       # process-pool helpers
-  mesh_flatten_workers.py# picklable flatten tile workers
   building_altitude/     # Building altitude + random height
-  water_altitude/        # Water median altitude from mesh
-  mask_points/           # Polygon mask → outline (+ optional legacy centers)
-  mesh_flatten/          # Flatten quantized mesh under roads (Delaunay Z)
+  mask_points/           # Road/water mask → outline PointZ (+ optional legacy centers)
   line_of_sight/         # Line-of-Sight checker
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
@@ -25,7 +22,7 @@ Database/                # Named input/output folders for the UI
 `%APPDATA%\QGIS\QGIS3\profiles\default\processing\scripts\`.  
 If you edited tools in their subfolders, run `python scripts/sync_qgis_processing.py` first to refresh that folder.
 
-When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) (and for flatten: `parallel_util.py`, `mesh_flatten_workers.py`) available under the same `scripts/` parent. Shared helpers: [`scripts/crs_util.py`](scripts/crs_util.py), [`scripts/atomic_io.py`](scripts/atomic_io.py).
+When adding a script to the QGIS Processing Toolbox, add the **algorithm** `.py` and keep that tool’s other files in the same folder. Also keep [`scripts/quantized_mesh.py`](scripts/quantized_mesh.py) and [`scripts/parallel_util.py`](scripts/parallel_util.py) available under the same `scripts/` parent. Shared helpers: [`scripts/crs_util.py`](scripts/crs_util.py), [`scripts/atomic_io.py`](scripts/atomic_io.py).
 
 ### Output CRS
 
@@ -37,13 +34,11 @@ Vector tools and road-mesh flatten write to a sibling ``*.partial`` path and onl
 
 ### Worker processes
 
-Several mesh-heavy tools accept **Worker processes**: `0` = auto (up to 8 cores), `1` = serial. Applies to mesh altitude sampling / tile patching on:
+Several mesh-heavy tools accept **Worker processes**: `0` = auto (up to 8 cores), `1` = serial. Applies to mesh altitude sampling on:
 
-- Flatten road masks in quantized mesh
+- Road mask / water mask outline points with altitude
 - Tree mask polygons to spaced points (altitude phase)
-- Polygon mask points with altitude
 - Building altitude and random height
-- Water median quantized-mesh altitude
 
 ## Building altitude and random height
 
@@ -85,26 +80,7 @@ python "scripts\building_altitude\generate_altitude_shapefile.py" --min 0 --max 
 
 Output: `Building Altitude Outputs/B_BUILDINGS_A_with_altitude_precise.gpkg`
 
-## Water median quantized-mesh altitude
-
-Folder: [`scripts/water_altitude/`](scripts/water_altitude/)
-
-| File | Role |
-| --- | --- |
-| [`water_median_altitude.py`](scripts/water_altitude/water_median_altitude.py) | QGIS Processing algorithm |
-| Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh reader |
-
-Adds hardcoded **`altitude`** = **median** mesh elevation for each water polygon.
-
-Samples exterior-ring vertices and edge midpoints, a point-on-surface, and a light interior grid (default step **25 m**; set to **0** for outline-only). Meant for lakes/ponds (one flat elevation per feature). No valid samples → NULL.
-
-### Install / run in QGIS
-
-1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
-2. Select `scripts/water_altitude/water_median_altitude.py` (keep `quantized_mesh.py` available)
-3. Run **QGIS Projects → Water median quantized-mesh altitude**
-
-## Polygon mask points with altitude
+## Polygon outline points with altitude
 
 Folder: [`scripts/mask_points/`](scripts/mask_points/)
 
@@ -115,41 +91,15 @@ Folder: [`scripts/mask_points/`](scripts/mask_points/)
 
 Samples **PointZ** features along polygon **outlines** (exterior rings **and holes**), at a chosen **outline spacing** in meters. Vertices are always kept; intermediate stations are added along edges. Each point gets hardcoded `altitude` from the quantized mesh plus `point_role` (`outline` or `center`).
 
-Optional toggle **Add center points (legacy)** (off by default): older sparse-grid / chord-midpoint center samples. Prefer **Flatten road masks in quantized mesh** so Unreal and the DTM share the same outline-Delaunay surface.
+Used for **road masks** and **water masks** (UI: **Road mask outline points…** / **Water mask outline points…**).
+
+Optional toggle **Add center points (legacy)** (off by default): older sparse-grid / chord-midpoint center samples.
 
 ### Install / run in QGIS
 
 1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
 2. Select `scripts/mask_points/polygon_mask_points.py` (keep `quantized_mesh.py` available)
-3. Run **QGIS Projects → Polygon mask points with altitude**
-4. If you still have the old script loaded, remove `polygon_outline_points.py` from the QGIS scripts folder
-
-## Flatten road masks in quantized mesh
-
-Folder: [`scripts/mesh_flatten/`](scripts/mesh_flatten/)
-
-| File | Role |
-| --- | --- |
-| [`flatten_road_mesh.py`](scripts/mesh_flatten/flatten_road_mesh.py) | QGIS Processing algorithm |
-| Shared: [`quantized_mesh.py`](scripts/quantized_mesh.py) | Mesh read / height rewrite |
-
-**Run after** generating outline PointZ (mask-points tool, centers off). Copies the input tileset to a new folder (never overwrites). Sample selection and TIN rules match **Unreal RoadPlacer**:
-
-- Outline/curb PointZ on/near mask (**15 m** snap default) or inside mask (`point_role=center` skipped)
-- Inject mask ring vertices with nearest PointZ height
-- 2D Delaunay; keep triangles whose centroid is inside the mask; set mesh vertices inside the mask to that linear Z
-- Optional **Lower interior**: drop terrain under masks; **Smooth edge blend** on (default) or off for a stair step; strip/blend width + max drop
-- Optional **Interior lowering only**: skip TIN flatten; input an already-flattened mesh and only apply the drop (outline points not required)
-
-Processes **all** `.terrain` tiles under the folder (`{x}/{y}` and `{level}/{x}/{y}`).
-
-### Install / run in QGIS
-
-1. Add `scripts/mesh_flatten/flatten_road_mesh.py` to the toolbox (keep `quantized_mesh.py`, `parallel_util.py`, and `mesh_flatten_workers.py` available)
-2. Run **QGIS Projects → Flatten road masks in quantized mesh**
-3. Full flatten: road masks, outline points + altitude field, input mesh, empty output folder
-4. Lowering only: enable **Interior lowering only**, set input to your previous flatten output, masks + blend/drop meters (no outline points)
-5. Optional **Worker processes** (`0`=auto) speeds tile patching on multi-core PCs
+3. Run **QGIS Projects → Polygon outline points with altitude**
 
 ## Line-of-Sight checker
 

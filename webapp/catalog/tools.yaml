@@ -38,8 +38,23 @@ domains:
   roads_masks: roads/masks
   roads_outline_points: roads/outline_points
   water_footprints: water/footprints
+  water_outline_points: water/outline_points
   mesh: mesh
   imagery: imagery
+
+# Friendly names for Order-stage ports (domain / library file types).
+domain_labels:
+  buildings_footprints: Buildings footprints
+  buildings_zones: Buildings zones
+  trees_footprints: Tree footprints
+  trees_points: Tree points
+  roads_vectors: Roads vectors
+  roads_masks: Roads masks
+  roads_outline_points: Roads outline points
+  water_footprints: Water footprints
+  water_outline_points: Water outline points
+  mesh: Mesh
+  imagery: Imagery
 
 # Immutable imports — only these domains create a source/ tier.
 source_domains:
@@ -78,14 +93,15 @@ pipelines:
     label: Roads
     steps:
       - id: polygon_mask_points
-      - id: flatten_road_mesh
-        wire:
-          INPUT_OUTLINE_POINTS: previous
+  - id: water
+    label: Water
+    steps:
+      - id: water_outline_points
 
 tools:
   - id: tree_mask_to_points
     algorithm: script:tree_mask_to_points
-    display_name: Tree mask polygons to spaced points
+    display_name: Trees mask to points
     tabs: [trees]
     description: Place spaced PointZ samples inside tree footprints.
     params:
@@ -120,7 +136,7 @@ tools:
 
   - id: thin_tree_points
     algorithm: script:thin_tree_points
-    display_name: Thin tree points
+    display_name: Trees thinning
     tabs: [trees]
     description: Keep a random fraction of tree points (input not overwritten).
     params:
@@ -149,7 +165,7 @@ tools:
 
   - id: sample_tree_rgb
     algorithm: script:sample_tree_rgb
-    display_name: Sample tree RGB from GeoTIFF
+    display_name: Trees RGB
     tabs: [trees]
     description: Sample R/G/B from imagery and attach to tree points.
     params:
@@ -173,7 +189,7 @@ tools:
 
   - id: building_altitude_and_height
     algorithm: script:building_altitude_and_height
-    display_name: Building altitude and random height
+    display_name: Buildings altitude and height
     tabs: [buildings]
     description: Add altitude, max_altitude, and random height from mesh.
     params:
@@ -215,7 +231,7 @@ tools:
 
   - id: assign_roof_type
     algorithm: script:assign_roof_type
-    display_name: Assign roof type from zones
+    display_name: Buildings roof types
     tabs: [buildings]
     description: Assign roof_type from zone polygons.
     params:
@@ -243,12 +259,14 @@ tools:
 
   - id: polygon_mask_points
     algorithm: script:polygon_mask_points
-    display_name: Polygon mask points with altitude
+    display_name: Roads mask to outline points
     tabs: [roads]
-    description: Outline PointZ samples along road masks (for flatten / Unreal).
+    description: >
+      Densify road-mask outlines to PointZ samples with mesh altitude
+      (same engine as water outline points).
     params:
       - id: INPUT_POLYGONS
-        label: Polygons
+        label: Road mask polygons
         type: vector_file
         library: roads_masks
         required: true
@@ -283,88 +301,23 @@ tools:
         default: 0
         min: 0
       - id: OUTPUT
-        label: Mask points with altitude
+        label: Outline points with altitude
         type: vector_output
         domain: roads_outline_points
         default_tier: working
         default_name: road_outline_points.shp
         required: true
 
-  - id: flatten_road_mesh
-    algorithm: script:flatten_road_mesh
-    display_name: Flatten road masks in quantized mesh
-    tabs: [roads]
-    description: Copy tileset and flatten / lower DTM under road masks.
-    params:
-      - id: INPUT_MASKS
-        label: Road mask polygons
-        type: vector_file
-        library: roads_masks
-        required: true
-      - id: INPUT_OUTLINE_POINTS
-        label: Outline points (PointZ; skip if lowering-only)
-        type: vector_file
-        library: roads_outline_points
-        required: false
-      - id: ALTITUDE_FIELD
-        label: Altitude field
-        type: text
-        default: altitude
-        required: false
-      - id: INPUT_MESH
-        label: Input quantized-mesh tileset (all LODs)
-        type: folder
-        library: mesh
-        mesh_pick: tileset
-        required: true
-      - id: OUTPUT_MESH
-        label: Output quantized-mesh tileset folder
-        type: folder_output
-        domain: mesh
-        default_tier: working
-        default_name: mesh_flattened
-        required: true
-      - id: NEAR_DISTANCE
-        label: Point near-mask snap (m)
-        type: number
-        default: 15.0
-        min: 0.0
-      - id: LOWERING_ONLY
-        label: Interior lowering only (skip TIN)
-        type: boolean
-        default: false
-      - id: LOWER_INTERIOR
-        label: Lower interior under mask
-        type: boolean
-        default: false
-      - id: SMOOTH_BLEND
-        label: Smooth edge blend (off = stair)
-        type: boolean
-        default: true
-      - id: EDGE_STRIP
-        label: Edge strip / blend width (m)
-        type: number
-        default: 0.5
-        min: 0.0
-      - id: INTERIOR_DROP
-        label: Max interior drop (m)
-        type: number
-        default: 0.5
-        min: 0.0
-      - id: WORKERS
-        label: Worker processes (0=auto, 1=serial)
-        type: integer
-        default: 0
-        min: 0
-
-  - id: water_median_altitude
-    algorithm: script:water_median_altitude
-    display_name: Water median quantized-mesh altitude
+  - id: water_outline_points
+    algorithm: script:polygon_mask_points
+    display_name: Water mask to outline points
     tabs: [water]
-    description: Add median mesh altitude per water polygon.
+    description: >
+      Densify water-mask outlines to PointZ samples with mesh altitude
+      (same engine as road outline points).
     params:
-      - id: INPUT_WATER
-        label: Water footprints
+      - id: INPUT_POLYGONS
+        label: Water mask polygons
         type: vector_file
         library: water_footprints
         required: true
@@ -374,22 +327,36 @@ tools:
         library: mesh
         mesh_pick: lod
         required: true
-      - id: INTERIOR_STEP
-        label: Interior sample step (m, 0 = outline only)
+      - id: SPACING
+        label: Outline point spacing (m)
         type: number
-        default: 25.0
-        min: 0.0
+        default: 5.0
+        min: 0.01
+      - id: ADD_CENTER_POINTS
+        label: Add center points (legacy)
+        type: boolean
+        default: false
+      - id: CENTER_MODE
+        label: Center point mode (legacy)
+        type: enum
+        options: ["Sparse grid (legacy)", "Chord midpoints (legacy)"]
+        default: 0
+      - id: CENTER_GRID_SPACING
+        label: Center grid spacing (m, legacy)
+        type: number
+        default: 5.0
+        min: 0.01
       - id: WORKERS
         label: Worker processes (0=auto, 1=serial)
         type: integer
         default: 0
         min: 0
       - id: OUTPUT
-        label: Water with altitude
+        label: Outline points with altitude
         type: vector_output
-        domain: water_footprints
+        domain: water_outline_points
         default_tier: working
-        default_name: water_altitude.shp
+        default_name: water_outline_points.shp
         required: true
 
   - id: layers_alignment
@@ -433,17 +400,17 @@ tools:
         default_tier: working
         default_name: water_aligned.shp
         required: true
-      - id: OUTPUT_BUILDINGS
-        label: Aligned buildings
-        type: vector_output
-        domain: buildings_footprints
-        default_tier: working
-        default_name: buildings_aligned.shp
-        required: true
       - id: OUTPUT_TREES
         label: Aligned trees
         type: vector_output
         domain: trees_footprints
         default_tier: working
         default_name: trees_aligned.shp
+        required: true
+      - id: OUTPUT_BUILDINGS
+        label: Aligned buildings
+        type: vector_output
+        domain: buildings_footprints
+        default_tier: working
+        default_name: buildings_aligned.shp
         required: true

@@ -242,7 +242,7 @@ def list_mesh_choices(
 
     mesh_pick:
       lod      — highest LOD only (auto-picked; other levels hidden)
-      tileset  — full tileset root (all LODs), for flatten etc.
+      tileset  — full tileset root (all LODs)
     """
     choices: List[Dict[str, str]] = []
     if not tier_dir.is_dir():

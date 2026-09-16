@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 import traceback
+import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -36,9 +38,25 @@ from catalog_loader import (
     map_root,
     output_name_stem,
     resolve_output_path,
-    resolve_pipeline,
     tool_by_id,
     tools_for_tab,
+)
+from flow_graph import (
+    add_edge,
+    dag_layout,
+    ensure_order_for_edge,
+    flat_run_order,
+    input_ports,
+    output_ports,
+    param_by_id,
+    port_domain_key,
+    port_file_type,
+    port_kind,
+    remove_edge,
+    sync_flow_edges,
+    sync_manual_order,
+    validate_edge,
+    wires_from_edges,
 )
 from qgis_runner import find_qgis_process, run_queue
 import user_defaults
@@ -89,6 +107,12 @@ state: Dict[str, Any] = {
     "selected": set(),
     "page": "select",
     "values": {},
+    "flow": {
+        "edges": [],  # [{from, from_param, to, to_param}, ...]
+        "order": [],  # manual top→bottom tool ids
+        "seeded_tools": set(),
+        "pending_link": None,  # {tool, param, role} while connecting
+    },
     "qgis_bat": None,
     "log_lines": [],
     "maple_mode": False,
@@ -211,9 +235,26 @@ def render_header() -> None:
 
 
 PAGE_META = {
-    "select": {"step": 1, "kicker": "pipeline // select", "title": "Choose processing modules"},
-    "configure": {"step": 2, "kicker": "pipeline // configure", "title": "Wire inputs & parameters"},
-    "run": {"step": 3, "kicker": "pipeline // execute", "title": "qgis_process queue"},
+    "select": {
+        "step": 1,
+        "kicker": "pipeline // select",
+        "title": "Choose processing modules",
+    },
+    "order": {
+        "step": 2,
+        "kicker": "pipeline // run order",
+        "title": "Arrange run order & links",
+    },
+    "configure": {
+        "step": 3,
+        "kicker": "pipeline // configure",
+        "title": "Wire inputs & parameters",
+    },
+    "run": {
+        "step": 4,
+        "kicker": "pipeline // execute",
+        "title": "qgis_process queue",
+    },
 }
 
 
@@ -239,6 +280,32 @@ def _try_find_qgis() -> str:
         return str(exc)
 
 
+def _refresh_select_panels_soon(*, tools: bool = False) -> None:
+    """Defer panel rebuilds so click handlers inside them can finish."""
+
+    def _run() -> None:
+        if tools:
+            tools_refresh = state.get("_tools_panel_refresh")
+            if callable(tools_refresh):
+                tools_refresh()
+        queue_refresh = state.get("_queue_panel_refresh")
+        if callable(queue_refresh):
+            queue_refresh()
+
+    ui.timer(0.0, _run, once=True)
+
+
+def _sync_selection_chrome(*, refresh_tools: bool = False) -> None:
+    """Refresh count / queue / tools without remounting the page hero."""
+    count_el = state.get("_selected_count_el")
+    if count_el is not None:
+        try:
+            count_el.set_text(f"{len(state['selected'])} selected")
+        except RuntimeError:
+            pass
+    _refresh_select_panels_soon(tools=refresh_tools)
+
+
 def _toggle_tool(tool_id: str, checked: bool) -> None:
     """Update selection without rebuilding the page."""
     tool = tool_by_id(CATALOG, tool_id)
@@ -249,21 +316,47 @@ def _toggle_tool(tool_id: str, checked: bool) -> None:
         selected.add(tool_id)
     else:
         selected.discard(tool_id)
+    _sync_flow()
 
     card = (state.get("_tool_cards") or {}).get(tool_id)
     if card is not None:
-        if checked:
-            card.classes(add="is-selected")
-        else:
-            card.classes(remove="is-selected")
+        try:
+            if checked:
+                card.classes(add="is-selected")
+            else:
+                card.classes(remove="is-selected")
+        except RuntimeError:
+            pass
 
-    count_el = state.get("_selected_count_el")
-    if count_el is not None:
-        count_el.set_text(f"{len(selected)} selected")
+    # Checkbox already matches the user click; only refresh the queue.
+    _sync_selection_chrome(refresh_tools=False)
 
-    queue_refresh = state.get("_queue_panel_refresh")
-    if callable(queue_refresh):
-        queue_refresh()
+
+def _mark_all_tools() -> None:
+    """Select every non-placeholder catalog tool (no full-page remount)."""
+    for tool in CATALOG.get("tools") or []:
+        if tool.get("placeholder"):
+            continue
+        state["selected"].add(tool["id"])
+    _sync_flow()
+    _sync_selection_chrome(refresh_tools=True)
+
+
+def _remove_all_tools() -> None:
+    """Deselect every tool (no full-page remount)."""
+    state["selected"].clear()
+    _sync_flow()
+    _sync_selection_chrome(refresh_tools=True)
+
+
+def _remove_tool(tool_id: str) -> None:
+    """Deselect one tool from the run queue (rebuilds tab checkboxes)."""
+    tool = tool_by_id(CATALOG, tool_id)
+    if tool and tool.get("placeholder"):
+        return
+    state["selected"].discard(tool_id)
+    _sync_flow()
+    _sync_selection_chrome(refresh_tools=True)
 
 
 def _init_defaults_for(tool: Dict[str, Any]) -> None:
@@ -349,8 +442,50 @@ def _resolve_param_value(tool: Dict[str, Any], param: Dict[str, Any], raw_val: A
     return raw_val
 
 
+def _sync_flow() -> None:
+    """Keep flow edges/order in sync with the current tool selection."""
+    flow = state.setdefault(
+        "flow",
+        {"edges": [], "order": [], "seeded_tools": set(), "pending_link": None},
+    )
+    selected = set(state.get("selected") or ())
+    edges, seeded = sync_flow_edges(
+        CATALOG,
+        selected,
+        list(flow.get("edges") or []),
+        set(flow.get("seeded_tools") or ()),
+    )
+    flow["edges"] = edges
+    flow["seeded_tools"] = seeded
+    flow["order"] = sync_manual_order(
+        CATALOG, selected, list(flow.get("order") or [])
+    )
+    pending = flow.get("pending_link")
+    if isinstance(pending, dict):
+        # Support both old {from,...} and new {tool,role,param} shapes
+        pend_tool = pending.get("tool") or pending.get("from")
+        if pend_tool not in selected:
+            flow["pending_link"] = None
+
+
+def _flow_edges() -> List[Dict[str, str]]:
+    _sync_flow()
+    return list((state.get("flow") or {}).get("edges") or [])
+
+
+def _flow_order() -> List[str]:
+    _sync_flow()
+    return list((state.get("flow") or {}).get("order") or [])
+
+
 def _selected_tools() -> List[Dict[str, Any]]:
-    ordered_ids, _wires = resolve_pipeline(CATALOG, state["selected"])
+    _sync_flow()
+    ordered_ids = flat_run_order(
+        CATALOG,
+        set(state["selected"]),
+        _flow_edges(),
+        _flow_order(),
+    )
     out: List[Dict[str, Any]] = []
     for tid in ordered_ids:
         tool = tool_by_id(CATALOG, tid)
@@ -360,8 +495,20 @@ def _selected_tools() -> List[Dict[str, Any]]:
 
 
 def _pipeline_wires() -> Dict[str, Dict[str, tuple]]:
-    _ordered, wires = resolve_pipeline(CATALOG, state["selected"])
-    return wires
+    return wires_from_edges(_flow_edges())
+
+
+def _reset_flow_defaults() -> None:
+    """Clear all wires and restore catalog default tool order."""
+    selected = set(state.get("selected") or ())
+    flow = state.setdefault(
+        "flow",
+        {"edges": [], "order": [], "seeded_tools": set(), "pending_link": None},
+    )
+    flow["edges"] = []
+    flow["order"] = sync_manual_order(CATALOG, selected, [])
+    flow["seeded_tools"] = set(selected)
+    flow["pending_link"] = None
 
 
 def _build_jobs() -> List[Dict[str, Any]]:
@@ -575,7 +722,12 @@ def render_maple_toggle() -> None:
 
 def render_steps() -> None:
     step = PAGE_META[state["page"]]["step"]
-    labels = [("01", "Select"), ("02", "Configure"), ("03", "Run")]
+    labels = [
+        ("01", "Select"),
+        ("02", "Order"),
+        ("03", "Configure"),
+        ("04", "Run"),
+    ]
     with ui.element("div").classes("qt-steps"):
         for i, (num, label) in enumerate(labels, start=1):
             cls = "qt-step"
@@ -587,32 +739,46 @@ def render_steps() -> None:
 
 
 def render_select_page() -> None:
-    def go_configure() -> None:
+    def go_order() -> None:
         if not state["selected"]:
             ui.notify("Select at least one tool.", type="warning")
             return
         for tool in _selected_tools():
             _init_defaults_for(tool)
-        state["page"] = "configure"
+        _sync_flow()
+        state["page"] = "order"
         render_body.refresh()
 
     @ui.refreshable
     def queue_panel() -> None:
-        ordered = _selected_tools()
+        _sync_flow()
+        tool_ids = flat_run_order(
+            CATALOG, set(state["selected"]), _flow_edges(), _flow_order()
+        )
         ui.label("run queue").classes("qt-meta-label q-mb-sm")
-        if not ordered:
+        if not tool_ids:
             ui.label("No tools selected").classes("qt-hint q-mb-md")
         else:
             with ui.element("div").classes("qt-queue-list q-mb-md"):
-                for i, tool in enumerate(ordered, start=1):
+                for i, tid in enumerate(tool_ids, start=1):
+                    tool = tool_by_id(CATALOG, tid)
+                    if not tool:
+                        continue
                     with ui.element("div").classes("qt-queue-item"):
                         ui.label(f"{i:02d}").classes("qt-queue-num")
                         ui.label(tool["display_name"]).classes("qt-queue-name")
 
+                        def _on_remove(tool_id: str = tid) -> None:
+                            _remove_tool(tool_id)
+
+                        ui.button(icon="close", on_click=_on_remove).props(
+                            "flat dense round size=sm color=grey-5"
+                        ).classes("qt-queue-remove").tooltip("Remove from selection")
+
         ui.button(
-            "Continue to Process",
+            "Continue to Order",
             icon="arrow_forward",
-            on_click=go_configure,
+            on_click=go_order,
         ).classes("qt-btn-primary w-full").props("unelevated no-caps")
 
     state["_queue_panel_refresh"] = queue_panel.refresh
@@ -621,8 +787,17 @@ def render_select_page() -> None:
         ui.label("Armed modules appear with a teal edge. Queue as many as you need.").classes(
             "qt-lede"
         )
-        count_el = ui.label(f"{len(state['selected'])} selected").classes("qt-brand-sub")
-        state["_selected_count_el"] = count_el
+        with ui.row().classes("items-center gap-3 no-wrap"):
+            ui.button("Mark all", on_click=_mark_all_tools).props(
+                "flat dense no-caps color=teal-4"
+            ).tooltip("Select every available tool")
+            ui.button("Remove all", on_click=_remove_all_tools).props(
+                "flat dense no-caps color=grey-5"
+            ).tooltip("Deselect every tool")
+            count_el = ui.label(f"{len(state['selected'])} selected").classes(
+                "qt-brand-sub"
+            )
+            state["_selected_count_el"] = count_el
 
     with ui.row().classes("w-full qt-select-layout no-wrap items-start gap-4"):
         with ui.column().classes("qt-select-main flex-grow"):
@@ -639,55 +814,77 @@ def render_select_page() -> None:
                         tab_refs[tab["id"]] = _dual_icon_tab(tab)
                 render_maple_toggle()
 
-            state["_tool_cards"] = {}
-            with ui.tab_panels(tabs, value=CATALOG["tabs"][0]["id"]).classes(
-                "w-full"
-            ):
-                for tab in CATALOG.get("tabs", []):
-                    with ui.tab_panel(tab_refs[tab["id"]]):
-                        tools = tools_for_tab(CATALOG, tab["id"])
-                        if not tools:
-                            ui.label("No tools in this lane yet.").classes("qt-lede")
-                            continue
-                        for i, tool in enumerate(tools):
-                            tid = tool["id"]
-                            is_placeholder = bool(tool.get("placeholder"))
-                            checked = (not is_placeholder) and tid in state["selected"]
-                            card_cls = "qt-tool-card w-full q-mb-sm q-pa-md"
-                            if checked:
-                                card_cls += " is-selected"
-                            if is_placeholder:
-                                card_cls += " is-placeholder"
-                            with ui.card().classes(card_cls) as card:
-                                if not is_placeholder:
-                                    state["_tool_cards"][tid] = card
-                                with ui.column().classes("gap-1 w-full"):
-                                    if is_placeholder:
-                                        with ui.row().classes(
-                                            "items-center gap-2 no-wrap"
-                                        ):
-                                            ui.label(tool["display_name"]).classes(
-                                                "text-body1"
+            default_tab = CATALOG["tabs"][0]["id"]
+            active_tab = state.get("_select_tab") or default_tab
+            if active_tab not in tab_refs:
+                active_tab = default_tab
+
+            @ui.refreshable
+            def tools_panel() -> None:
+                state["_tool_cards"] = {}
+                cur = state.get("_select_tab") or active_tab
+                if cur not in tab_refs:
+                    cur = default_tab
+                with ui.tab_panels(
+                    tabs,
+                    value=cur,
+                    on_change=lambda e: state.__setitem__("_select_tab", e.value),
+                ).classes("w-full"):
+                    for tab in CATALOG.get("tabs", []):
+                        with ui.tab_panel(tab_refs[tab["id"]]):
+                            tools = tools_for_tab(CATALOG, tab["id"])
+                            if not tools:
+                                ui.label("No tools in this lane yet.").classes(
+                                    "qt-lede"
+                                )
+                                continue
+                            for tool in tools:
+                                tid = tool["id"]
+                                is_placeholder = bool(tool.get("placeholder"))
+                                checked = (
+                                    (not is_placeholder)
+                                    and tid in state["selected"]
+                                )
+                                card_cls = "qt-tool-card w-full q-mb-sm q-pa-md"
+                                if checked:
+                                    card_cls += " is-selected"
+                                if is_placeholder:
+                                    card_cls += " is-placeholder"
+                                with ui.card().classes(card_cls) as card:
+                                    if not is_placeholder:
+                                        state["_tool_cards"][tid] = card
+                                    with ui.column().classes("gap-1 w-full"):
+                                        if is_placeholder:
+                                            with ui.row().classes(
+                                                "items-center gap-2 no-wrap"
+                                            ):
+                                                ui.label(
+                                                    tool["display_name"]
+                                                ).classes("text-body1")
+                                                ui.label("coming soon").classes(
+                                                    "qt-badge-soon"
+                                                )
+                                        else:
+                                            cb = ui.checkbox(
+                                                text=tool["display_name"],
+                                                value=checked,
+                                                on_change=lambda e, tool_id=tid: _toggle_tool(
+                                                    tool_id, e.value
+                                                ),
+                                            ).props("color=teal-4 dense")
+                                            cb.tooltip(
+                                                tool.get("description") or ""
                                             )
-                                            ui.label("coming soon").classes(
-                                                "qt-badge-soon"
+                                            ui.label(f"script:{tid}").classes(
+                                                "qt-tool-id q-ml-lg"
                                             )
-                                    else:
-                                        cb = ui.checkbox(
-                                            text=tool["display_name"],
-                                            value=checked,
-                                            on_change=lambda e, tool_id=tid: _toggle_tool(
-                                                tool_id, e.value
-                                            ),
-                                        ).props("color=teal-4 dense")
-                                        cb.tooltip(tool.get("description") or "")
-                                        ui.label(f"script:{tid}").classes(
-                                            "qt-tool-id q-ml-lg"
+                                    if tool.get("description"):
+                                        ui.label(tool["description"]).classes(
+                                            "qt-tool-desc q-mt-xs"
                                         )
-                                if tool.get("description"):
-                                    ui.label(tool["description"]).classes(
-                                        "qt-tool-desc q-mt-xs"
-                                    )
+
+            state["_tools_panel_refresh"] = tools_panel.refresh
+            tools_panel()
 
         with ui.card().classes("qt-panel qt-select-queue q-pa-md"):
             queue_panel()
@@ -944,17 +1141,246 @@ def _param_widget(
     ui.label(f"Unsupported param type: {ptype}").classes("text-negative")
 
 
+def _port_label(param: Dict[str, Any]) -> str:
+    return port_file_type(CATALOG, param)
+
+
+def _apply_flow_connect(payload: Dict[str, Any]) -> None:
+    """Validate and store an edge created by drag-connect."""
+    candidate = {
+        "from": str(payload.get("from") or ""),
+        "from_param": str(payload.get("from_param") or ""),
+        "to": str(payload.get("to") or ""),
+        "to_param": str(payload.get("to_param") or ""),
+    }
+    flow = state.setdefault(
+        "flow",
+        {"edges": [], "order": [], "seeded_tools": set(), "pending_link": None},
+    )
+    err = validate_edge(CATALOG, list(flow.get("edges") or []), candidate)
+    if err:
+        ui.notify(err, type="warning")
+        return
+    flow["edges"] = add_edge(list(flow.get("edges") or []), candidate)
+    flow["order"] = ensure_order_for_edge(list(flow.get("order") or []), candidate)
+    flow["pending_link"] = None
+    render_body.refresh()
+
+
+def _render_port_dot(
+    tool_id: str, param: Dict[str, Any], role: str, *, wired: bool = False
+) -> None:
+    kind = port_kind(param)
+    ftype = port_domain_key(param) or kind
+    label = _port_label(param).replace('"', "&quot;")
+    wired_cls = " is-wired" if wired else ""
+    tip = "Input" if role == "in" else "Output"
+    ui.html(
+        f'<div class="qt-port-dot is-{role}{wired_cls}" '
+        f'data-tool="{tool_id}" data-param="{param["id"]}" '
+        f'data-role="{role}" data-kind="{kind}" data-ftype="{ftype}" '
+        f'title="{tip}: {label}"></div>',
+        sanitize=False,
+    )
+
+
+def _tool_tab_id(tool: Dict[str, Any]) -> str:
+    tabs = tool.get("tabs") or []
+    return str(tabs[0]) if tabs else "common"
+
+
+def _tab_material_icon(tab_id: str) -> str:
+    for tab in CATALOG.get("tabs") or []:
+        if tab.get("id") == tab_id:
+            return str(tab.get("icon") or "extension")
+    return "extension"
+
+
+def _render_tool_node_icon(tool: Dict[str, Any]) -> None:
+    """Small tab-matching icon for Order-stage nodes."""
+    tab_id = _tool_tab_id(tool)
+    if state.get("maple_mode") and tab_id in MAPLE_ICONS:
+        meta = _maple_meta(tab_id)
+        ui.html(
+            f'<img class="qt-node-icon-img" src="{meta["src"]}" '
+            f'alt="{meta["name"]}" title="{meta["name"]}" />',
+            sanitize=False,
+        )
+        return
+    icon = _tab_material_icon(tab_id)
+    ui.html(
+        f'<span class="material-icons qt-node-icon" aria-hidden="true">{icon}</span>',
+        sanitize=False,
+    )
+
+
 def render_pipeline_nodes(tools: List[Dict[str, Any]]) -> None:
-    """Visual run-order as connected nodes."""
-    with ui.element("div").classes("qt-pipeline q-mb-md"):
-        ui.label("run order").classes("qt-meta-label q-mb-sm")
-        with ui.element("div").classes("qt-pipeline-track"):
-            for i, tool in enumerate(tools):
-                if i > 0:
-                    ui.element("div").classes("qt-pipeline-edge")
-                with ui.element("div").classes("qt-pipeline-node"):
-                    ui.label(f"{i + 1:02d}").classes("qt-pipeline-step")
+    """Layered DAG: roots on top, children column-aligned under parents."""
+    _sync_flow()
+    edges = _flow_edges()
+    selected_ids = set(state["selected"])
+    layers, cols = dag_layout(CATALOG, selected_ids, edges, _flow_order())
+    tool_ids = [tid for row in layers for tid in row]
+    flow = state["flow"]
+    flow["order"] = list(tool_ids)
+    wires = wires_from_edges(edges)
+    n_cols = 1
+    if cols:
+        # Half-columns park in floor(c) and shift right; leave a trailing track.
+        n_cols = max(1, int(math.ceil(max(cols.values()) - 1e-9)) + 1)
+
+    def refresh() -> None:
+        render_body.refresh()
+
+    def _node_grid_style(tid: str) -> str:
+        """Place node on the column grid; half-columns shift into the mid-gap."""
+        c = float(cols.get(tid, 0.0))
+        if abs(c - round(c)) < 1e-6:
+            return f"grid-column: {int(round(c)) + 1}"
+        # Occupies the left cell only (no span) so siblings don't collide and wrap.
+        # Shift into the mid-gap: 50% of cell + half of the 1.5rem column-gap.
+        left = int(math.floor(c)) + 1
+        return (
+            f"grid-column: {left}; "
+            "transform: translateX(calc(50% + 0.75rem))"
+        )
+
+    def render_node(tid: str) -> None:
+        tool = tool_by_id(CATALOG, tid)
+        if not tool:
+            return
+        ins = input_ports(tool)
+        outs = output_ports(tool)
+        with ui.element("div").classes(
+            "qt-pipeline-node qt-flow-node qt-flow-node-v"
+        ).style(_node_grid_style(tid)):
+            with ui.element("div").classes("qt-node-ports is-in"):
+                for ip in ins:
+                    wired = (wires.get(tid) or {}).get(ip["id"])
+                    with ui.element("div").classes("qt-port-slot"):
+                        _render_port_dot(tid, ip, "in", wired=bool(wired))
+                        ui.label(_port_label(ip)).classes(
+                            "qt-port-mini"
+                            + (" is-wired" if wired else "")
+                        )
+
+            with ui.element("div").classes("qt-flow-body"):
+                with ui.element("div").classes("qt-node-head"):
+                    _render_tool_node_icon(tool)
                     ui.label(tool["display_name"]).classes("qt-pipeline-title")
+
+            with ui.element("div").classes("qt-node-ports is-out"):
+                for op in outs:
+                    with ui.element("div").classes("qt-port-slot"):
+                        _render_port_dot(tid, op, "out")
+                        ui.label(_port_label(op)).classes("qt-port-mini")
+
+    with ui.element("div").classes("qt-pipeline q-mb-md"):
+        with ui.row().classes("w-full items-center justify-between q-mb-sm no-wrap"):
+            ui.label("run order · dag").classes("qt-meta-label")
+            ui.button(
+                "Clear links & reset order",
+                on_click=lambda: (_reset_flow_defaults(), refresh()),
+            ).props("flat dense no-caps color=teal-4").tooltip(
+                "Remove all connections and restore default order"
+            )
+
+        ui.label(
+            "Roots on the top row; children sit under their parent in "
+            "left→right output-port order (or between parents when there are two). "
+            "Drag matching-type dots to connect."
+        ).classes("qt-hint q-mb-md")
+
+        grid_cols = f"repeat({n_cols}, minmax(12.5rem, 14rem))"
+        with ui.element("div").classes("qt-flow-canvas qt-flow-canvas-wide"):
+            with ui.element("div").classes("qt-dag"):
+                for row in layers:
+                    with ui.element("div").classes("qt-dag-row qt-dag-row-grid").style(
+                        f"grid-template-columns: {grid_cols}"
+                    ):
+                        for tid in row:
+                            render_node(tid)
+
+        if edges:
+            ui.label("connections").classes("qt-meta-label q-mt-sm q-mb-xs")
+            with ui.element("div").classes("qt-edge-list"):
+                for e in edges:
+                    src_t = tool_by_id(CATALOG, e["from"])
+                    dst_t = tool_by_id(CATALOG, e["to"])
+                    src_name = (src_t or {}).get("display_name", e["from"])
+                    dst_name = (dst_t or {}).get("display_name", e["to"])
+                    sp = param_by_id(src_t, e["from_param"]) if src_t else None
+                    ftype = (
+                        port_file_type(CATALOG, sp) if sp else e["from_param"]
+                    )
+                    with ui.row().classes(
+                        "items-center justify-between w-full qt-edge-row no-wrap"
+                    ):
+                        ui.label(
+                            f"{src_name} · {ftype} → {dst_name}"
+                        ).classes("qt-edge-text")
+
+                        def drop(_e=None, edge=e) -> None:
+                            flow["edges"] = remove_edge(
+                                list(flow.get("edges") or []), edge
+                            )
+                            refresh()
+
+                        ui.button(icon="close", on_click=drop).props(
+                            "flat dense round color=grey-5"
+                        ).tooltip("Remove connection")
+
+    edges_js = json.dumps(edges)
+    ui.timer(
+        0.05,
+        lambda: ui.run_javascript(
+            f"window.qtFlow && window.qtFlow.mount({edges_js})"
+        ),
+        once=True,
+    )
+
+
+def render_order_page() -> None:
+    """Dedicated stage to edit run-order groups and DAG links."""
+    selected = _selected_tools()
+    if not selected:
+        ui.label("No tools selected.").classes("qt-hint q-mb-md")
+        with ui.row().classes("w-full justify-between qt-footer-actions"):
+            def back_empty() -> None:
+                state["page"] = "select"
+                render_body.refresh()
+
+            ui.button("Back", icon="arrow_back", on_click=back_empty).classes(
+                "qt-btn-ghost"
+            ).props("flat no-caps")
+        return
+
+    ui.label(
+        "Tools lay out as a DAG: children line up under their parent "
+        "(or between parents). Drag output dots to input dots to wire files."
+    ).classes("qt-lede q-mb-md")
+
+    render_pipeline_nodes(selected)
+
+    with ui.row().classes("w-full justify-between qt-footer-actions"):
+        def back() -> None:
+            state["page"] = "select"
+            render_body.refresh()
+
+        def go_configure() -> None:
+            for tool in _selected_tools():
+                _init_defaults_for(tool)
+            state["page"] = "configure"
+            render_body.refresh()
+
+        ui.button("Back", icon="arrow_back", on_click=back).classes(
+            "qt-btn-ghost"
+        ).props("flat no-caps")
+        ui.button(
+            "Continue to Configure",
+            icon="arrow_forward",
+            on_click=go_configure,
+        ).classes("qt-btn-primary").props("unelevated no-caps")
 
 
 def render_configure_page() -> None:
@@ -968,7 +1394,7 @@ def render_configure_page() -> None:
     if not _map_chosen():
         with ui.row().classes("w-full justify-between qt-footer-actions"):
             def back_early() -> None:
-                state["page"] = "select"
+                state["page"] = "order"
                 render_body.refresh()
 
             ui.button("Back", icon="arrow_back", on_click=back_early).classes(
@@ -976,11 +1402,31 @@ def render_configure_page() -> None:
             ).props("flat no-caps")
         return
 
-    if len(selected) > 1:
-        render_pipeline_nodes(selected)
-    elif len(selected) == 1:
-        # Still show a single node so the page has clear context
-        render_pipeline_nodes(selected)
+    # Read-only summary of the order decided on the previous stage
+    if selected:
+        with ui.element("div").classes("qt-pipeline q-mb-md"):
+            ui.label("run order (from Order stage)").classes(
+                "qt-meta-label q-mb-sm"
+            )
+            tool_ids = flat_run_order(
+                CATALOG, set(state["selected"]), _flow_edges(), _flow_order()
+            )
+            with ui.element("div").classes(
+                "qt-pipeline-track qt-pipeline-track-v"
+            ):
+                for i, tid in enumerate(tool_ids):
+                    tool = tool_by_id(CATALOG, tid)
+                    if not tool:
+                        continue
+                    if i > 0:
+                        with ui.element("div").classes("qt-v-edge is-gap"):
+                            ui.element("div").classes("qt-v-edge-line")
+                    with ui.element("div").classes("qt-pipeline-node"):
+                        with ui.element("div").classes("qt-node-head"):
+                            _render_tool_node_icon(tool)
+                            ui.label(tool["display_name"]).classes(
+                                "qt-pipeline-title"
+                            )
 
     for step_i, tool in enumerate(selected, start=1):
         _init_defaults_for(tool)
@@ -1000,7 +1446,7 @@ def render_configure_page() -> None:
 
     with ui.row().classes("w-full justify-between qt-footer-actions"):
         def back() -> None:
-            state["page"] = "select"
+            state["page"] = "order"
             render_body.refresh()
 
         def run() -> None:
@@ -1325,6 +1771,8 @@ def render_body() -> None:
     page = state["page"]
     if page == "select":
         render_select_page()
+    elif page == "order":
+        render_order_page()
     elif page == "configure":
         render_configure_page()
     else:
@@ -1344,11 +1792,27 @@ def index() -> None:
         info="#38bdf8",
         warning="#fbbf24",
     )
-    ui.add_head_html('<link rel="stylesheet" href="/static/theme.css?v=sub-progress-1">')
+    ui.add_head_html('<link rel="stylesheet" href="/static/theme.css?v=queue-remove-1">')
+    ui.add_head_html('<script src="/static/flow_connect.js?v=5"></script>')
     ui.add_head_html(
         '<meta name="theme-color" content="#070b12">'
         '<style>body{margin:0}</style>'
     )
+
+    def _on_flow_connect(e) -> None:
+        args = e.args if hasattr(e, "args") else e
+        if isinstance(args, dict):
+            _apply_flow_connect(args)
+
+    def _on_flow_reject(e) -> None:
+        args = e.args if hasattr(e, "args") else e
+        reason = "Incompatible ports."
+        if isinstance(args, dict) and args.get("reason"):
+            reason = str(args["reason"])
+        ui.notify(reason, type="warning")
+
+    ui.on("flow-connect", _on_flow_connect)
+    ui.on("flow-connect-reject", _on_flow_reject)
     # Critical tab crossfade (also in theme.css) — keeps working even if CSS is cached
     ui.add_css(
         """
@@ -1370,7 +1834,7 @@ def index() -> None:
         """
     )
     render_header()
-    with ui.column().classes("w-full max-w-6xl mx-auto q-pa-md"):
+    with ui.column().classes("w-full mx-auto q-pa-md qt-page-shell"):
         ui.label(
             f"Tools write under {DEFAULT_DATABASE}/<map>/… Pick the map on Configure. "
             "Runs via qgis_process — Desktop stays closed."

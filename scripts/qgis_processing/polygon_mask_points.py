@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-QGIS Processing algorithm: sample polygon-mask points with altitude.
+QGIS Processing algorithm: sample polygon outline points with altitude.
 
-Always densifies outlines (exterior rings and holes). Optionally adds
-interior center points with mesh altitude (Unreal can ignore centers
-below the local road plane).
+Used for road masks and water footprints (any polygon layer). Always
+densifies outlines (exterior rings and holes). Optionally adds interior
+center points with mesh altitude (legacy).
 
 Center modes:
   - Sparse grid (default): axis-aligned grid inside each polygon part
@@ -81,7 +81,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         return "polygon_mask_points"
 
     def displayName(self):
-        return self.tr("Polygon mask points with altitude")
+        return self.tr("Polygon outline points with altitude")
 
     def group(self):
         return self.tr("QGIS Projects")
@@ -94,11 +94,12 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             "Samples points along every polygon outline — exterior rings "
             "and inner holes — at a chosen spacing in meters, and assigns "
             "terrain altitude from a Cesium quantized-mesh tileset.\n\n"
+            "Use for road masks or water footprints when the shore/curb "
+            "should follow mesh height (not a single flat altitude).\n\n"
             f"Output is PointZ with '{ALTITUDE_FIELD}' and '{ROLE_FIELD}' "
             f"('{ROLE_OUTLINE}' or '{ROLE_CENTER}').\n\n"
             "Optional (legacy): Add center points inside each mask — sparse "
-            "grid or chord midpoints. Prefer flattening the quantized mesh "
-            "with 'Flatten road masks in quantized mesh' instead.\n\n"
+            "grid or chord midpoints.\n\n"
             "Expects {x}/{y}.terrain tiles (gzip), EPSG:4326 / TMS; "
             "finest LOD in the folder is used."
         )
@@ -168,7 +169,7 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
-                self.tr("Mask points with altitude"),
+                self.tr("Outline points with altitude"),
             )
         )
 

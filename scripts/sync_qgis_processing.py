@@ -2,7 +2,7 @@
 """
 Sync flat copies of QGIS Processing scripts into scripts/qgis_processing/.
 
-Edit tools in their normal folders (tree_points/, mesh_flatten/, …), then run:
+Edit tools in their normal folders (tree_points/, mask_points/, …), then run:
 
     python scripts/sync_qgis_processing.py
 
@@ -27,16 +27,13 @@ DEPLOY_FILES = [
     ("parallel_util.py", "parallel_util.py"),
     ("quantized_mesh.py", "quantized_mesh.py"),
     ("crs_util.py", "crs_util.py"),
-    ("mesh_flatten_workers.py", "mesh_flatten_workers.py"),
     # Processing algorithms + their side modules
     ("tree_points/tree_mask_to_points.py", "tree_mask_to_points.py"),
     ("tree_points/thin_tree_points.py", "thin_tree_points.py"),
     ("tree_points/sample_tree_rgb.py", "sample_tree_rgb.py"),
     ("tree_points/rgb_core.py", "rgb_core.py"),
     ("building_altitude/building_altitude_and_height.py", "building_altitude_and_height.py"),
-    ("water_altitude/water_median_altitude.py", "water_median_altitude.py"),
     ("mask_points/polygon_mask_points.py", "polygon_mask_points.py"),
-    ("mesh_flatten/flatten_road_mesh.py", "flatten_road_mesh.py"),
     ("roof_type/assign_roof_type.py", "assign_roof_type.py"),
     ("roof_type/roof_type_core.py", "roof_type_core.py"),
     ("layers_alignment/layers_alignment.py", "layers_alignment.py"),
