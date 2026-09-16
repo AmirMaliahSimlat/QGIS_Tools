@@ -58,7 +58,8 @@ from flow_graph import (
     validate_edge,
     wires_from_edges,
 )
-from qgis_runner import find_qgis_process, run_queue
+from qgis_runner import QgisProcessConfig, find_qgis_process, run_queue
+import app_settings
 import user_defaults
 
 CATALOG = load_catalog()
@@ -113,6 +114,7 @@ state: Dict[str, Any] = {
         "seeded_tools": set(),
         "pending_link": None,  # {tool, param, role} while connecting
     },
+    "qgis_root": None,
     "qgis_bat": None,
     "log_lines": [],
     "maple_mode": False,
@@ -209,12 +211,12 @@ def render_header() -> None:
             with ui.column().classes("gap-0"):
                 ui.label("QGIS Tools").classes("qt-brand-title")
                 ui.label("local process console").classes("qt-brand-sub")
-        with ui.row().classes("items-center q-mr-md gap-2"):
+        with ui.row().classes("items-center q-mr-md gap-2 no-wrap"):
             ui.label("DB_ROOT").classes("qt-brand-sub")
             db_input = (
                 ui.input(value=state["database"])
                 .props(_field_props())
-                .classes("w-72")
+                .classes("w-56")
             )
 
             def apply_db() -> None:
@@ -232,6 +234,90 @@ def render_header() -> None:
             ui.button(icon="folder_open", on_click=apply_db).props(
                 "flat dense round color=teal-4"
             ).tooltip("Apply database root")
+
+            ui.label("QGIS").classes("qt-brand-sub q-ml-sm")
+            qgis_input = (
+                ui.input(
+                    value=state.get("qgis_root") or "",
+                    placeholder=r"C:\Program Files\QGIS 3.xx.x",
+                )
+                .props(_field_props())
+                .classes("w-72")
+            )
+            state["_qgis_root_input"] = qgis_input
+
+            def apply_qgis() -> None:
+                raw = (qgis_input.value or "").strip().strip('"')
+                if not raw:
+                    app_settings.set_qgis_root(None)
+                    state["qgis_root"] = None
+                    state["qgis_bat"] = None
+                    found = _try_find_qgis()
+                    if state.get("qgis_root"):
+                        qgis_input.set_value(state["qgis_root"])
+                        ui.notify(
+                            f"Auto-detected → {state['qgis_root']}",
+                            type="positive",
+                        )
+                    elif found and not found.startswith("Could not"):
+                        qgis_input.set_value(found)
+                        ui.notify(f"Auto-detected → {found}", type="positive")
+                    else:
+                        ui.notify(
+                            "QGIS not found. Paste the install folder "
+                            r"(…\QGIS 3.xx.x), not the .bat.",
+                            type="warning",
+                        )
+                    return
+                root = Path(raw)
+                if root.is_file():
+                    # User pasted a .bat by mistake — accept and normalize to folder.
+                    root = app_settings.root_from_qgis_process_bat(root)
+                if not root.is_dir():
+                    ui.notify(f"Folder not found: {root}", type="negative")
+                    return
+                bat = app_settings.qgis_process_bat_from_root(root)
+                if not bat.is_file():
+                    ui.notify(
+                        f"Missing {app_settings.QGIS_PROCESS_REL.as_posix()} "
+                        f"under {root}",
+                        type="negative",
+                    )
+                    return
+                resolved_root = str(root.resolve())
+                app_settings.set_qgis_root(resolved_root)
+                state["qgis_root"] = resolved_root
+                state["qgis_bat"] = str(bat)
+                qgis_input.set_value(resolved_root)
+                ui.notify(f"QGIS → {resolved_root}", type="positive")
+
+            def detect_qgis() -> None:
+                try:
+                    found = find_qgis_process(QgisProcessConfig())
+                except FileNotFoundError:
+                    ui.notify(
+                        "Could not auto-detect QGIS. Install it or paste the "
+                        r"install folder (…\QGIS 3.xx.x).",
+                        type="warning",
+                    )
+                    return
+                root = app_settings.root_from_qgis_process_bat(found)
+                resolved_root = str(root)
+                app_settings.set_qgis_root(resolved_root)
+                state["qgis_root"] = resolved_root
+                state["qgis_bat"] = str(found.resolve())
+                qgis_input.set_value(resolved_root)
+                ui.notify(f"Detected → {resolved_root}", type="positive")
+
+            qgis_input.on("keydown.enter", apply_qgis)
+            ui.button(icon="save", on_click=apply_qgis).props(
+                "flat dense round color=teal-4"
+            ).tooltip(
+                r"Save QGIS install folder (uses bin\qgis_process-qgis-ltr.bat)"
+            )
+            ui.button(icon="travel_explore", on_click=detect_qgis).props(
+                "flat dense round color=grey-5"
+            ).tooltip("Auto-detect QGIS install folder on this PC")
 
 
 PAGE_META = {
@@ -270,12 +356,26 @@ def _db() -> Path:
     return map_root(_db_root(), str(mid))
 
 
+def _qgis_config() -> QgisProcessConfig:
+    root = (state.get("qgis_root") or "").strip()
+    if not root:
+        root = app_settings.get_qgis_root() or ""
+    if root:
+        return QgisProcessConfig(
+            bat_path=app_settings.qgis_process_bat_from_root(root)
+        )
+    return QgisProcessConfig()
+
+
 def _try_find_qgis() -> str:
     try:
-        p = find_qgis_process()
+        p = find_qgis_process(_qgis_config())
         state["qgis_bat"] = str(p)
+        root = app_settings.root_from_qgis_process_bat(p)
+        state["qgis_root"] = str(root)
         return str(p)
     except FileNotFoundError as exc:
+        state["qgis_root"] = app_settings.get_qgis_root()
         state["qgis_bat"] = None
         return str(exc)
 
@@ -1608,7 +1708,7 @@ def _start_run() -> None:
                     "stage": "Finding qgis_process…",
                 }
             )
-            bat = find_qgis_process()
+            bat = find_qgis_process(_qgis_config())
             state["qgis_bat"] = str(bat)
             _set_run_progress({"stage": "Building job list…"})
             jobs = _build_jobs()
@@ -1843,6 +1943,9 @@ def index() -> None:
 
 
 if __name__ in {"__main__", "__mp_main__"}:
+    saved_root = app_settings.get_qgis_root()
+    if saved_root:
+        state["qgis_root"] = saved_root
     _try_find_qgis()
     ui.run(
         title="QGIS Tools · Process Console",

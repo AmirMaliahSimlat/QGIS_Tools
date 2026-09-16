@@ -6,8 +6,9 @@ Building Altitude Outputs/
 Database/*
 !Database/README.md
 
-# Local UI prefs (parameter defaults)
+# Local UI prefs (parameter defaults + machine paths)
 webapp/user_defaults.json
+webapp/app_settings.json
 
 # Python
 __pycache__/
