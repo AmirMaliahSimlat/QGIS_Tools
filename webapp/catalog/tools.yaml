@@ -28,7 +28,7 @@ maps:
     label: GFK
 
 # Domain roots under each map.
-# source_domains get source/working/tests; others only working/tests (tool outputs).
+# source_domains get source/staging/tests/final; others only staging/tests/final.
 domains:
   buildings_footprints: buildings/footprints
   buildings_zones: buildings/zones
@@ -37,9 +37,11 @@ domains:
   roads_vectors: roads/vectors
   roads_masks: roads/masks
   roads_outline_points: roads/outline_points
+  roads_mesh_3d: roads/mesh_3d
   water_footprints: water/footprints
   water_outline_points: water/outline_points
-  mesh: mesh
+  quantized_mesh: elevation/quantized-mesh
+  dtm: elevation/DTM
   imagery: imagery
 
 # Friendly names for Order-stage ports (domain / library file types).
@@ -51,9 +53,11 @@ domain_labels:
   roads_vectors: Roads vectors
   roads_masks: Roads masks
   roads_outline_points: Roads outline points
+  roads_mesh_3d: Roads 3D mesh
   water_footprints: Water footprints
   water_outline_points: Water outline points
-  mesh: Mesh
+  quantized_mesh: Quantized mesh
+  dtm: DTM
   imagery: Imagery
 
 # Immutable imports — only these domains create a source/ tier.
@@ -61,13 +65,15 @@ source_domains:
   - buildings_footprints
   - trees_footprints
   - roads_vectors
+  - roads_mesh_3d
   - water_footprints
-  - mesh
+  - quantized_mesh
+  - dtm
   - imagery
 
-tiers: [source, working, tests]
-# Input pickers scan in this order (working = current best). source skipped if N/A.
-input_tiers: [working, source, tests]
+tiers: [source, staging, tests, final]
+# Input pickers scan in this order (final = best finished product).
+input_tiers: [final, staging, source, tests]
 
 # Hardcoded chains (also mirrored in flow_graph._WIRE_CHAINS).
 # Selected tools in a chain run upstream→downstream; skipped tools bridge only
@@ -111,7 +117,7 @@ tools:
       - id: INPUT_MESH
         label: Quantized-mesh (highest LOD)
         type: folder
-        library: mesh
+        library: quantized_mesh
         mesh_pick: lod
         required: true
       - id: MIN_DISTANCE
@@ -128,7 +134,7 @@ tools:
         label: Spaced tree points
         type: vector_output
         domain: trees_points
-        default_tier: working
+        default_tier: staging
         default_name: tree_points.shp
         required: true
 
@@ -157,7 +163,7 @@ tools:
         label: Thinned tree points
         type: vector_output
         domain: trees_points
-        default_tier: working
+        default_tier: staging
         default_name: tree_points_thinned.shp
         required: true
 
@@ -181,7 +187,7 @@ tools:
         label: Trees with RGB
         type: vector_output
         domain: trees_points
-        default_tier: working
+        default_tier: final
         default_name: tree_points_rgb.shp
         required: true
 
@@ -199,7 +205,7 @@ tools:
       - id: INPUT_MESH
         label: Quantized-mesh (highest LOD)
         type: folder
-        library: mesh
+        library: quantized_mesh
         mesh_pick: lod
         required: true
       - id: MIN_VALUE
@@ -223,7 +229,7 @@ tools:
         label: Buildings with altitude and height
         type: vector_output
         domain: buildings_footprints
-        default_tier: working
+        default_tier: staging
         default_name: buildings_altitude.shp
         required: true
 
@@ -251,7 +257,7 @@ tools:
         label: Buildings with roof_type
         type: vector_output
         domain: buildings_footprints
-        default_tier: working
+        default_tier: final
         default_name: buildings_roof_type.shp
         required: true
 
@@ -271,7 +277,7 @@ tools:
       - id: INPUT_MESH
         label: Quantized-mesh (highest LOD)
         type: folder
-        library: mesh
+        library: quantized_mesh
         mesh_pick: lod
         required: true
       - id: SPACING
@@ -302,8 +308,42 @@ tools:
         label: Outline points with altitude
         type: vector_output
         domain: roads_outline_points
-        default_tier: working
+        default_tier: final
         default_name: road_outline_points.shp
+        required: true
+
+  - id: burn_roads_into_quantized_mesh
+    algorithm: script:burn_roads_into_quantized_mesh
+    display_name: Push QM under 3D roads (poke-through only)
+    tabs: [roads]
+    description: >
+      Lower quantized-mesh vertices that poke through a Unreal 3D road mesh
+      (all LODs). At each in-mask vertex not on a straddling QM triangle:
+      target = road plane Z − clearance; new = min(old, target). Rim vertices
+      on triangles that also have an outside corner are never lowered.
+    params:
+      - id: INPUT_ROADS
+        label: Roads 3D mesh (triangles with Z)
+        type: vector_file
+        library: roads_mesh_3d
+        required: true
+      - id: INPUT_MESH
+        label: Quantized-mesh tileset
+        type: folder
+        library: quantized_mesh
+        mesh_pick: tileset
+        required: true
+      - id: OFFSET_DOWN
+        label: Under-road clearance (m)
+        type: number
+        default: 0.05
+        min: 0.0
+      - id: OUTPUT_MESH
+        label: Output quantized-mesh tileset
+        type: folder_output
+        domain: quantized_mesh
+        default_tier: final
+        default_name: mesh_roads_burned
         required: true
 
   - id: water_outline_points
@@ -322,7 +362,7 @@ tools:
       - id: INPUT_MESH
         label: Quantized-mesh (highest LOD)
         type: folder
-        library: mesh
+        library: quantized_mesh
         mesh_pick: lod
         required: true
       - id: SPACING
@@ -353,7 +393,7 @@ tools:
         label: Outline points with altitude
         type: vector_output
         domain: water_outline_points
-        default_tier: working
+        default_tier: final
         default_name: water_outline_points.shp
         required: true
 
@@ -395,20 +435,20 @@ tools:
         label: Aligned water
         type: vector_output
         domain: water_footprints
-        default_tier: working
+        default_tier: staging
         default_name: water_aligned.shp
         required: true
       - id: OUTPUT_TREES
         label: Aligned trees
         type: vector_output
         domain: trees_footprints
-        default_tier: working
+        default_tier: staging
         default_name: trees_aligned.shp
         required: true
       - id: OUTPUT_BUILDINGS
         label: Aligned buildings
         type: vector_output
         domain: buildings_footprints
-        default_tier: working
+        default_tier: staging
         default_name: buildings_aligned.shp
         required: true

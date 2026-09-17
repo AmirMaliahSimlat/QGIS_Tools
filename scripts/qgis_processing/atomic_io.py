@@ -212,6 +212,10 @@ class AtomicOutput:
                 raise FileNotFoundError(
                     f"Atomic partial missing (looked for {self.temp} and variants)"
                 )
+            if self.final.exists():
+                raise FileExistsError(
+                    f"Output already exists (choose a different name): {self.final}"
+                )
             _publish_file_with_retries(written, self.final)
             # Clean any leftover sibling partials from alternate naming.
             for cand in _existing_temp_candidates(self.temp, self.final):
@@ -280,6 +284,27 @@ def _remove_vector_path(path: Path) -> None:
             pass
 
 
+def _vector_destination_exists(final: Path) -> bool:
+    """True if a vector file (or shapefile sidecar) already occupies this name."""
+    if final.suffix.lower() == ".shp":
+        stem = final.with_suffix("")
+        for ext in (
+            ".shp",
+            ".shx",
+            ".dbf",
+            ".prj",
+            ".cpg",
+            ".qpj",
+            ".sbn",
+            ".sbx",
+            ".qmd",
+        ):
+            if stem.with_suffix(ext).exists():
+                return True
+        return False
+    return final.exists()
+
+
 def begin_atomic_file_output(
     parameters: Parameters,
     key: str = "OUTPUT",
@@ -292,17 +317,23 @@ def begin_atomic_file_output(
 
     Shapefile outputs skip atomic rename: OGR writes several sidecars, and
     FeatureSink keeps handles open that block a clean multi-file rename.
+
+    Refuses to overwrite an existing destination (no auto-rename).
     """
     final = _as_path(parameters.get(key))
     if final is None:
         # Temporary / memory / unrecognized — leave QGIS destination as-is.
         return parameters, None
 
+    if _vector_destination_exists(final):
+        raise FileExistsError(
+            f"Output already exists (choose a different name): {final}"
+        )
+
     # Shapefile: write directly to the final path (multi-file format).
     # Normalize to a plain path string so parameterAsSink never sees a
     # QgsProcessingOutputLayerDefinition repr.
     if final.suffix.lower() == ".shp":
-        _remove_vector_path(final)
         for cand in _existing_temp_candidates(partial_path_for(final), final):
             _remove_vector_path(cand)
         new_params = dict(parameters)

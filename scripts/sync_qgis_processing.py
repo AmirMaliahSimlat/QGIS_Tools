@@ -39,6 +39,8 @@ DEPLOY_FILES = [
     ("layers_alignment/layers_alignment.py", "layers_alignment.py"),
     ("line_of_sight/line_of_sight_checker.py", "line_of_sight_checker.py"),
     ("line_of_sight/los_core.py", "los_core.py"),
+    ("dtm_burn/burn_roads_into_quantized_mesh.py", "burn_roads_into_quantized_mesh.py"),
+    ("dtm_burn/qm_burn_core.py", "qm_burn_core.py"),
 ]
 
 

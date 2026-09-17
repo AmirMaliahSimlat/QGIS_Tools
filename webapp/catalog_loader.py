@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
+import re
+import shutil
 
 import yaml
 
@@ -14,10 +16,16 @@ DEFAULT_DATABASE = REPO_ROOT / "Database"
 
 VECTOR_EXTS = {".shp", ".gpkg", ".geojson", ".json", ".gml"}
 VECTOR_OUTPUT_EXT = ".shp"
-OUTPUT_TIERS = ("working", "tests")
-ALL_TIERS = ("source", "working", "tests")
-INPUT_TIERS = ("working", "source", "tests")
-WORKING_TIERS = ("working", "tests")
+RASTER_EXTS = {".tif", ".tiff"}
+RASTER_OUTPUT_EXT = ".tif"
+OUTPUT_TIERS = ("final", "staging", "tests")
+ALL_TIERS = ("source", "staging", "tests", "final")
+# Prefer finished products, then intermediates, then imports, then experiments.
+INPUT_TIERS = ("final", "staging", "source", "tests")
+# Domains without source/ (tool outputs only).
+STAGE_TIERS = ("staging", "tests", "final")
+# Catalog keys that use Cesium quantized-mesh folder picking.
+MESH_LIBRARY_KEYS = frozenset({"quantized_mesh"})
 
 # Legacy flat folders under Database/ (pre-map layout) — not treated as maps.
 _RESERVED_TOP = frozenset(
@@ -27,6 +35,7 @@ _RESERVED_TOP = frozenset(
         "roads",
         "water",
         "mesh",
+        "elevation",
         "imagery",
         "outputs",
     }
@@ -100,7 +109,7 @@ def domain_tiers(catalog: Dict[str, Any], domain_key: str) -> tuple:
     """Tiers that exist for a domain (source only for import domains)."""
     if domain_key in source_domain_keys(catalog):
         return tuple(catalog.get("tiers") or ALL_TIERS)
-    return WORKING_TIERS
+    return STAGE_TIERS
 
 
 def tier_path(map_dir: Path, catalog: Dict[str, Any], domain_key: str, tier: str) -> Optional[Path]:
@@ -132,6 +141,124 @@ def ensure_database_layout(
                 (base / rel / tier).mkdir(parents=True, exist_ok=True)
 
 
+def sanitize_map_id(name: str) -> str:
+    """Folder-safe map id: trim, spaces→_, strip Windows-illegal chars."""
+    text = (name or "").strip()
+    text = re.sub(r'[<>:"/\\|?*]', "", text)
+    text = re.sub(r"\s+", "_", text)
+    text = text.strip("._")
+    return text
+
+
+def create_map(
+    database_root: Path,
+    catalog: Dict[str, Any],
+    name: str,
+) -> str:
+    """
+    Create Database/<map_id>/ with the full domain/tier skeleton.
+
+    Returns the map id. Raises ValueError if the name is empty/invalid.
+    """
+    mid = sanitize_map_id(name)
+    if not mid:
+        raise ValueError("Enter a map name.")
+    ensure_database_layout(database_root, catalog, map_id=mid)
+    return mid
+
+
+def import_dest_dir(
+    map_dir: Path,
+    catalog: Dict[str, Any],
+    library_key: str,
+) -> Optional[Path]:
+    """
+    Folder where UI imports land for a library input.
+
+    Prefer ``source/`` when the domain has it (raw imports); otherwise ``staging/``.
+    """
+    root = domain_root(map_dir, catalog, library_key)
+    if root is None:
+        return None
+    allowed = domain_tiers(catalog, library_key)
+    tier = "source" if "source" in allowed else "staging"
+    if tier not in allowed:
+        tier = allowed[0] if allowed else "staging"
+    dest = (root / tier).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def _primary_imported_path(copied: Sequence[Path], *, prefer_folder: bool = False) -> Optional[Path]:
+    if not copied:
+        return None
+    if prefer_folder:
+        # Caller may pass a single directory path.
+        for p in copied:
+            if p.is_dir():
+                return p
+    preferred_exts = (".shp", ".gpkg", ".geojson", ".json", ".gml", ".tif", ".tiff")
+    by_ext = {p.suffix.lower(): p for p in copied if p.is_file()}
+    for ext in preferred_exts:
+        if ext in by_ext:
+            return by_ext[ext]
+    files = [p for p in copied if p.is_file()]
+    return files[0] if files else Path(copied[0])
+
+
+def import_paths_to_library(
+    map_dir: Path,
+    catalog: Dict[str, Any],
+    library_key: str,
+    sources: Sequence[Union[str, Path]],
+    *,
+    as_folder: bool = False,
+) -> Dict[str, Any]:
+    """
+    Copy selected files (or one folder) into the library import destination.
+
+    Never overwrites: existing names are skipped.
+    Returns {dest, copied, skipped, primary}.
+    """
+    dest = import_dest_dir(map_dir, catalog, library_key)
+    if dest is None:
+        raise ValueError(f"Unknown library “{library_key}”.")
+
+    copied: List[Path] = []
+    skipped: List[str] = []
+
+    for raw in sources:
+        src = Path(raw)
+        if not src.exists():
+            skipped.append(src.name or str(src))
+            continue
+        if as_folder or src.is_dir():
+            target = dest / src.name
+            if target.exists():
+                skipped.append(src.name)
+                continue
+            shutil.copytree(src, target)
+            copied.append(target)
+            continue
+        if not src.is_file():
+            skipped.append(src.name)
+            continue
+        target = dest / src.name
+        if target.exists():
+            skipped.append(src.name)
+            continue
+        shutil.copy2(src, target)
+        copied.append(target)
+
+    primary = _primary_imported_path(copied, prefer_folder=as_folder)
+    return {
+        "dest": dest,
+        "copied": copied,
+        "skipped": skipped,
+        "primary": primary,
+    }
+
+
 def list_vector_files(folder: Path) -> List[Path]:
     if not folder.is_dir():
         return []
@@ -142,6 +269,18 @@ def list_vector_files(folder: Path) -> List[Path]:
         if p.suffix.lower() not in VECTOR_EXTS:
             continue
         if p.suffix.lower() in {".shp", ".gpkg", ".geojson", ".json", ".gml"}:
+            found.append(p)
+    return found
+
+
+def list_raster_files(folder: Path) -> List[Path]:
+    if not folder.is_dir():
+        return []
+    found: List[Path] = []
+    for p in sorted(folder.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in RASTER_EXTS:
             found.append(p)
     return found
 
@@ -209,7 +348,7 @@ def _input_choice_label(tier: str, rest: str = "", *, folder: bool = False) -> s
     UI label for a Database pick.
 
     source tier: hide file/folder names — just ``source`` (optional ``/LOD``).
-    working/tests: ``tier/name``.
+    staging/tests/final: ``tier/name``.
     """
     rest = (rest or "").replace("\\", "/").strip("/")
     if tier == "source":
@@ -300,7 +439,7 @@ def list_mesh_choices(
         elif tier == "source":
             rest = child.name
         else:
-            # working/tests: tileset name only (LOD is implied = highest)
+            # staging/tests/final: tileset name only (LOD is implied = highest)
             rest = child.name
         choices.append(
             {
@@ -337,7 +476,7 @@ def library_choices(
     choices: List[Dict[str, str]] = []
     for tier in scan_tiers:
         tier_dir = root / tier
-        if library_key == "mesh" and kind in ("folder", "folder_output"):
+        if library_key in MESH_LIBRARY_KEYS and kind in ("folder", "folder_output"):
             choices.extend(
                 list_mesh_choices(
                     tier_dir,
@@ -355,6 +494,21 @@ def library_choices(
                 choices.append(
                     {
                         "label": _input_choice_label(tier, rest, folder=True),
+                        "path": str(p),
+                    }
+                )
+        elif kind in ("raster_file", "raster_output"):
+            files = list_raster_files(tier_dir)
+            for p in files:
+                if tier == "source" and len(files) == 1:
+                    rest = ""
+                elif tier == "source":
+                    rest = p.stem
+                else:
+                    rest = p.relative_to(tier_dir).as_posix()
+                choices.append(
+                    {
+                        "label": _input_choice_label(tier, rest),
                         "path": str(p),
                     }
                 )
@@ -377,13 +531,13 @@ def library_choices(
 
 
 def output_name_stem(name: str) -> str:
-    """Strip directory bits and a known vector extension from a user/default name."""
+    """Strip directory bits and a known vector/raster extension from a name."""
     raw = (name or "").strip().replace("\\", "/").lstrip("/")
     if not raw:
         return ""
     base = Path(raw).name
     suffix = Path(base).suffix.lower()
-    if suffix in VECTOR_EXTS:
+    if suffix in VECTOR_EXTS or suffix in RASTER_EXTS:
         return Path(base).stem
     return base
 
@@ -392,20 +546,54 @@ def finalize_output_filename(param: Dict[str, Any], name: str) -> str:
     """
     Turn a user-facing name (no type) into the on-disk file/folder name.
 
-    vector_output → always .shp; folder_output → bare folder name.
+    vector_output → .shp; raster_output → .tif; folder_output → bare folder name.
     """
     stem = output_name_stem(name)
     if not stem:
         stem = output_name_stem(str(param.get("default_name") or "output")) or "output"
     if param.get("type") == "folder_output":
         return stem
+    if param.get("type") == "raster_output":
+        return stem + RASTER_OUTPUT_EXT
     # vector_output and any other file sinks from the UI
     return stem + VECTOR_OUTPUT_EXT
 
 
-def default_output_spec(param: Dict[str, Any]) -> Dict[str, str]:
+_SHP_EXISTENCE_EXTS = (
+    ".shp",
+    ".shx",
+    ".dbf",
+    ".prj",
+    ".cpg",
+    ".qpj",
+    ".sbn",
+    ".sbx",
+    ".qmd",
+)
+
+
+def output_destination_taken(path: Union[str, Path], *, is_folder: bool = False) -> bool:
+    """True if saving here would collide with an existing file/folder (no overwrite)."""
+    p = Path(path)
+    if is_folder:
+        return p.exists()
+    if p.suffix.lower() == ".shp":
+        stem = p.with_suffix("")
+        return any(stem.with_suffix(ext).exists() for ext in _SHP_EXISTENCE_EXTS)
+    return p.exists()
+
+
+def default_output_spec(
+    param: Dict[str, Any],
+    *,
+    tier: Optional[str] = None,
+) -> Dict[str, str]:
+    chosen = tier if tier in ("staging", "final") else None
+    if chosen is None:
+        raw = str(param.get("default_tier") or "final")
+        chosen = raw if raw in ("staging", "final") else "final"
     return {
-        "tier": str(param.get("default_tier") or "working"),
+        "tier": chosen,
         "name": output_name_stem(str(param.get("default_name") or "output")),
     }
 
@@ -419,20 +607,20 @@ def resolve_output_path(
     """Turn {tier, name} into Database/<map>/<domain>/<tier>/<name[.shp]>."""
     domain_key = param.get("domain") or param.get("library") or "outputs"
     if isinstance(spec, dict):
-        tier = str(spec.get("tier") or "working")
+        tier = str(spec.get("tier") or "staging")
         name = str(spec.get("name") or param.get("default_name") or "output").strip()
     elif isinstance(spec, str) and spec:
         p = Path(spec)
         if p.is_absolute() or len(p.parts) > 1:
             return str(p)
         name = spec
-        tier = "working"
+        tier = "staging"
     else:
         d = default_output_spec(param)
         tier, name = d["tier"], d["name"]
 
     if tier not in OUTPUT_TIERS:
-        tier = "working"
+        tier = "staging"
     filename = finalize_output_filename(param, name)
 
     dest_dir = tier_path(map_dir, catalog, domain_key, tier)

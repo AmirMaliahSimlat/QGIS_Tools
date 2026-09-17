@@ -10,11 +10,12 @@ from catalog_loader import tool_by_id
 
 Edge = Dict[str, str]  # from, from_param, to, to_param
 
-_OUT_TYPES = frozenset({"vector_output", "folder_output"})
-_IN_TYPES = frozenset({"vector_file", "folder"})
+_OUT_TYPES = frozenset({"vector_output", "folder_output", "raster_output"})
+_IN_TYPES = frozenset({"vector_file", "folder", "raster_file"})
 _COMPAT = {
     "vector_output": frozenset({"vector_file"}),
     "folder_output": frozenset({"folder"}),
+    "raster_output": frozenset({"raster_file"}),
 }
 
 # Fixed pipelines. Each node is (tool_id, input_param_or_None).
@@ -62,12 +63,14 @@ def ports_compatible(out_param: Dict[str, Any], in_param: Dict[str, Any]) -> boo
 
 
 def port_kind(param: Dict[str, Any]) -> str:
-    """Short kind label for UI (vector / folder)."""
+    """Short kind label for UI (vector / folder / raster)."""
     t = param.get("type") or ""
     if t.startswith("vector"):
         return "vector"
     if t.startswith("folder"):
         return "folder"
+    if t.startswith("raster"):
+        return "raster"
     return t or "file"
 
 
@@ -315,6 +318,53 @@ def wires_from_edges(
     for e in edges:
         wires.setdefault(e["to"], {})[e["to_param"]] = (e["from"], e["from_param"])
     return wires
+
+
+def pipeline_output_tiers(
+    catalog: Dict[str, Any],
+    selected_ids: Set[str],
+    edges: Iterable[Edge],
+) -> Dict[Tuple[str, str], str]:
+    """
+    Map (tool_id, output_param_id) → ``staging`` | ``final`` for the selection.
+
+    If an output is wired into a selected downstream tool that itself produces
+    the same domain/file type, the upstream output defaults to ``staging``.
+    Otherwise it defaults to ``final``. ``tests`` is never returned.
+    """
+    selected_ids = set(selected_ids)
+    intermediate: Set[Tuple[str, str]] = set()
+
+    for e in edges:
+        from_id = e.get("from") or ""
+        to_id = e.get("to") or ""
+        from_param_id = e.get("from_param") or ""
+        if from_id not in selected_ids or to_id not in selected_ids:
+            continue
+        from_tool = tool_by_id(catalog, from_id)
+        to_tool = tool_by_id(catalog, to_id)
+        if not from_tool or not to_tool:
+            continue
+        out_param = param_by_id(from_tool, from_param_id)
+        if out_param is None:
+            continue
+        domain = port_domain_key(out_param)
+        if not domain:
+            continue
+        if any(port_domain_key(op) == domain for op in output_ports(to_tool)):
+            intermediate.add((from_id, from_param_id))
+
+    result: Dict[Tuple[str, str], str] = {}
+    for tid in selected_ids:
+        tool = tool_by_id(catalog, tid)
+        if not tool or tool.get("placeholder"):
+            continue
+        for op in output_ports(tool):
+            key = (tid, str(op.get("id") or ""))
+            if not key[1]:
+                continue
+            result[key] = "staging" if key in intermediate else "final"
+    return result
 
 
 def _undirected_components(

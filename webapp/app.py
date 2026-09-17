@@ -27,16 +27,20 @@ from nicegui import app, ui
 from catalog_loader import (
     DEFAULT_DATABASE,
     OUTPUT_TIERS,
+    RASTER_OUTPUT_EXT,
     VECTOR_OUTPUT_EXT,
+    create_map,
     default_map_id,
     default_output_spec,
     domain_tiers,
     ensure_database_layout,
+    import_paths_to_library,
     library_choices,
     list_maps,
     load_catalog,
     map_root,
     output_name_stem,
+    output_destination_taken,
     resolve_output_path,
     tool_by_id,
     tools_for_tab,
@@ -47,6 +51,7 @@ from flow_graph import (
     input_ports,
     output_ports,
     param_by_id,
+    pipeline_output_tiers,
     port_file_type,
     sync_flow_edges,
     sync_manual_order,
@@ -132,7 +137,7 @@ state: Dict[str, Any] = {
 
 # Input params whose values are paths under Database/<map>/…
 # (Outputs keep tier/name; only the map folder prefix changes.)
-_MAP_SCOPED_TYPES = frozenset({"vector_file", "folder"})
+_MAP_SCOPED_TYPES = frozenset({"vector_file", "folder", "raster_file"})
 
 
 def _map_chosen() -> bool:
@@ -180,23 +185,63 @@ def render_map_picker() -> None:
 
     with ui.column().classes("w-full gap-1"):
         ui.label("Map *").classes("text-caption text-grey-5")
-        map_sel = (
-            ui.select(
-                options=map_labels,
-                value=current,
-                label=None,
+        with ui.row().classes("w-full items-center no-wrap gap-2"):
+            map_sel = (
+                ui.select(
+                    options=map_labels,
+                    value=current,
+                    label=None,
+                )
+                .props(_field_props() + " clearable")
+                .classes("flex-grow")
             )
-            .props(_field_props() + " clearable")
-            .classes("w-full")
-        )
 
-        def on_map(e) -> None:
-            mid = e.value
-            if mid == state.get("map"):
-                return
-            _set_active_map(str(mid) if mid else None)
+            def on_map(e) -> None:
+                mid = e.value
+                if mid == state.get("map"):
+                    return
+                _set_active_map(str(mid) if mid else None)
 
-        map_sel.on_value_change(on_map)
+            map_sel.on_value_change(on_map)
+
+            def open_new_map() -> None:
+                with ui.dialog() as dlg, ui.card().classes("q-pa-md").style(
+                    "min-width: 22rem"
+                ):
+                    ui.label("New map").classes("text-h6")
+                    ui.label(
+                        "Creates Database/<name>/ with all domain and tier folders."
+                    ).classes("qt-hint q-mb-sm")
+                    name_inp = (
+                        ui.input(label="Map name", placeholder="e.g. Fort Riley")
+                        .props(_field_props())
+                        .classes("w-full")
+                    )
+
+                    def create() -> None:
+                        raw = (name_inp.value or "").strip()
+                        try:
+                            mid = create_map(_db_root(), CATALOG, raw)
+                        except ValueError as exc:
+                            ui.notify(str(exc), type="warning")
+                            return
+                        _set_active_map(mid)
+                        dlg.close()
+                        ui.notify(f"Map ready → {mid}", type="positive")
+                        render_body.refresh()
+
+                    with ui.row().classes("w-full justify-end gap-2 q-mt-md"):
+                        ui.button("Cancel", on_click=dlg.close).classes(
+                            "qt-btn-ghost"
+                        ).props("flat no-caps")
+                        ui.button("Create", on_click=create).classes(
+                            "qt-btn-primary"
+                        ).props("unelevated no-caps")
+                dlg.open()
+
+            ui.button(icon="create_new_folder", on_click=open_new_map).props(
+                "flat dense round color=teal-4"
+            ).tooltip("New map (create Database folders)")
 
 
 def render_header() -> None:
@@ -449,29 +494,50 @@ def _remove_tool(tool_id: str) -> None:
     _sync_selection_chrome(refresh_tools=True)
 
 
-def _init_defaults_for(tool: Dict[str, Any]) -> None:
+def _init_defaults_for(
+    tool: Dict[str, Any],
+    *,
+    tiers: Optional[Dict[Tuple[str, str], str]] = None,
+) -> None:
     tid = tool["id"]
+    if tiers is None:
+        # Use current flow edges without re-entering _sync_flow.
+        edges = list((state.get("flow") or {}).get("edges") or [])
+        tiers = pipeline_output_tiers(
+            CATALOG,
+            set(state.get("selected") or ()),
+            edges,
+        )
     if tid in state["values"]:
         # Migrate legacy full-path outputs / extensioned names to {tier, stem}
         for p in tool.get("params", []):
-            if p.get("type") not in ("vector_output", "folder_output"):
+            if p.get("type") not in ("vector_output", "folder_output", "raster_output"):
                 continue
             cur = state["values"][tid].get(p["id"])
+            pipe_tier = tiers.get((tid, p["id"]), "final")
             if isinstance(cur, str):
-                state["values"][tid][p["id"]] = default_output_spec(p)
+                state["values"][tid][p["id"]] = default_output_spec(p, tier=pipe_tier)
             elif isinstance(cur, dict) and "name" in cur:
                 cur = dict(cur)
                 cur["name"] = output_name_stem(str(cur.get("name") or ""))
                 if not cur["name"]:
-                    cur["name"] = default_output_spec(p)["name"]
+                    cur["name"] = default_output_spec(p, tier=pipe_tier)["name"]
+                # Legacy tier rename
+                if cur.get("tier") == "working":
+                    cur["tier"] = "staging"
+                # Keep explicit tests; otherwise follow the pipeline tree.
+                if cur.get("tier") != "tests":
+                    cur["tier"] = pipe_tier
                 state["values"][tid][p["id"]] = cur
         return
     vals: Dict[str, Any] = {}
     for p in tool.get("params", []):
         pid = p["id"]
         ptype = p["type"]
-        if ptype in ("vector_output", "folder_output"):
-            vals[pid] = default_output_spec(p)
+        if ptype in ("vector_output", "folder_output", "raster_output"):
+            vals[pid] = default_output_spec(
+                p, tier=tiers.get((tid, pid), "final")
+            )
         elif user_defaults.has(tid, pid):
             vals[pid] = user_defaults.get(tid, pid)
         elif "default" in p:
@@ -481,13 +547,35 @@ def _init_defaults_for(tool: Dict[str, Any]) -> None:
     state["values"][tid] = vals
 
 
+def _apply_pipeline_output_tiers(
+    *,
+    edges: Optional[List[Dict[str, str]]] = None,
+    selected: Optional[Set[str]] = None,
+) -> None:
+    """Refresh staging/final defaults from the current selection wires."""
+    selected_ids = set(selected if selected is not None else (state.get("selected") or ()))
+    edge_list = (
+        list(edges)
+        if edges is not None
+        else list((state.get("flow") or {}).get("edges") or [])
+    )
+    tiers = pipeline_output_tiers(CATALOG, selected_ids, edge_list)
+    for tid in selected_ids:
+        tool = tool_by_id(CATALOG, tid)
+        if not tool or tool.get("placeholder"):
+            continue
+        _init_defaults_for(tool, tiers=tiers)
+
+
 def _can_set_default(param: Dict[str, Any]) -> bool:
     """Params that ship with a catalog default can save a user override."""
     return "default" in param and param.get("type") not in (
         "vector_file",
         "folder",
+        "raster_file",
         "vector_output",
         "folder_output",
+        "raster_output",
     )
 
 
@@ -526,8 +614,129 @@ def _set_as_default_button(tool_id: str, param: Dict[str, Any]) -> None:
     )
 
 
+
+def _pick_local_files(*, title: str = "Import files") -> List[str]:
+    """Native multi-file dialog (local OS). Empty list if cancelled."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:  # pragma: no cover
+        ui.notify(f"File dialog unavailable: {exc}", type="negative")
+        return []
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        files = filedialog.askopenfilenames(
+            title=title,
+            filetypes=[
+                (
+                    "GIS files",
+                    "*.shp *.dbf *.shx *.prj *.cpg *.qpj *.sbn *.sbx "
+                    "*.gpkg *.geojson *.json *.gml *.tif *.tiff *.img",
+                ),
+                ("All files", "*.*"),
+            ],
+        )
+        return [str(p) for p in files] if files else []
+    finally:
+        root.destroy()
+
+
+def _pick_local_folder(*, title: str = "Import folder") -> Optional[str]:
+    """Native folder dialog (local OS). None if cancelled."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:  # pragma: no cover
+        ui.notify(f"Folder dialog unavailable: {exc}", type="negative")
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        chosen = filedialog.askdirectory(title=title)
+        return str(chosen) if chosen else None
+    finally:
+        root.destroy()
+
+
+def _import_button(
+    tool_id: str,
+    param: Dict[str, Any],
+) -> None:
+    """Browse + copy files into this input's Database library folder."""
+    lib = param.get("library")
+    ptype = param.get("type")
+    if not lib or ptype not in ("vector_file", "folder", "raster_file"):
+        return
+    if not _map_chosen():
+        return
+
+    def on_import(tool=tool_id, p=param, library=lib, kind=ptype) -> None:
+        if not _map_chosen():
+            ui.notify("Choose a map first", type="warning")
+            return
+        as_folder = kind == "folder"
+        if as_folder:
+            folder = _pick_local_folder(
+                title=f"Import folder → {p.get('label') or library}"
+            )
+            if not folder:
+                return
+            sources: List[str] = [folder]
+        else:
+            sources = _pick_local_files(
+                title=f"Import files → {p.get('label') or library}"
+            )
+            if not sources:
+                return
+        try:
+            result = import_paths_to_library(
+                _db(),
+                CATALOG,
+                library,
+                sources,
+                as_folder=as_folder,
+            )
+        except ValueError as exc:
+            ui.notify(str(exc), type="warning")
+            return
+        copied = result["copied"]
+        skipped = result["skipped"]
+        primary = result["primary"]
+        if primary is not None:
+            state["values"][tool][p["id"]] = str(primary)
+        parts = []
+        if copied:
+            parts.append(f"imported {len(copied)}")
+        if skipped:
+            parts.append(f"skipped {len(skipped)} (already exists)")
+        dest = result["dest"]
+        msg = ", ".join(parts) if parts else "nothing imported"
+        ui.notify(f"{msg} → {dest}", type="positive" if copied else "warning")
+        render_body.refresh()
+
+    tip = (
+        "Browse for a folder and copy it into this input's Database path"
+        if ptype == "folder"
+        else "Browse for files and copy into this input's Database path"
+    )
+    ui.button("Import", on_click=on_import).classes(
+        "qt-set-default flat dense no-caps"
+    ).props("color=teal-4").tooltip(tip)
+
+
 def _resolve_param_value(tool: Dict[str, Any], param: Dict[str, Any], raw_val: Any) -> Any:
-    if param.get("type") in ("vector_output", "folder_output"):
+    if param.get("type") in ("vector_output", "folder_output", "raster_output"):
         return resolve_output_path(_db(), CATALOG, param, raw_val)
     return raw_val
 
@@ -556,6 +765,7 @@ def _sync_flow() -> None:
         pend_tool = pending.get("tool") or pending.get("from")
         if pend_tool not in selected:
             flow["pending_link"] = None
+    _apply_pipeline_output_tiers(edges=edges, selected=selected)
 
 
 def _flow_edges() -> List[Dict[str, str]]:
@@ -651,8 +861,15 @@ def _build_jobs() -> List[Dict[str, Any]]:
                     raise ValueError(f"{tool['display_name']}: missing wired {p['label']}")
                 params[pid] = val
                 continue
-            if p.get("type") in ("vector_output", "folder_output"):
+            if p.get("type") in ("vector_output", "folder_output", "raster_output"):
                 path = resolve_output_path(_db(), CATALOG, p, val)
+                if output_destination_taken(
+                    path, is_folder=p.get("type") == "folder_output"
+                ):
+                    raise ValueError(
+                        f"{tool['display_name']}: output already exists — "
+                        f"choose a different name or tier ({path})"
+                    )
                 params[pid] = path
                 continue
             if val is None or val == "" or val == "(none)":
@@ -663,7 +880,7 @@ def _build_jobs() -> List[Dict[str, Any]]:
 
         produced[tid] = {}
         for p in tool.get("params", []):
-            if p.get("type") in ("vector_output", "folder_output"):
+            if p.get("type") in ("vector_output", "folder_output", "raster_output"):
                 if p["id"] in params:
                     produced[tid][p["id"]] = params[p["id"]]
 
@@ -1011,7 +1228,7 @@ def _param_widget(
             ui.label(str(src_path)).classes("qt-meta")
         return
 
-    if ptype in ("vector_file", "folder"):
+    if ptype in ("vector_file", "folder", "raster_file"):
         lib = param.get("library")
         choices = (
             library_choices(
@@ -1049,19 +1266,20 @@ def _param_widget(
                 state["values"][tool][key] = None if lab in (None, "(none)") else mapping.get(lab)
 
             sel.on_value_change(on_sel)
+            _import_button(tool_id, param)
             ui.button(icon="refresh", on_click=render_body.refresh).props(
                 "flat dense round color=teal-4"
             ).tooltip("Refresh folder list")
 
         if not choices:
             domain = (CATALOG.get("domains") or {}).get(lib, lib)
-            tier_hint = "|".join(domain_tiers(CATALOG, lib)) if lib else "working|tests"
+            tier_hint = "|".join(domain_tiers(CATALOG, lib)) if lib else "staging|tests|final"
             ui.label(
-                f"empty · Database/{state.get('map')}/{domain}/{{{tier_hint}}} — drop assets, then refresh"
+                f"empty · Database/{state.get('map')}/{domain}/{{{tier_hint}}} — Import or drop assets, then refresh"
             ).classes("qt-hint q-mb-sm")
         return
 
-    if ptype in ("vector_output", "folder_output"):
+    if ptype in ("vector_output", "folder_output", "raster_output"):
         spec = vals.get(pid)
         if not isinstance(spec, dict):
             spec = default_output_spec(param)
@@ -1074,10 +1292,13 @@ def _param_widget(
             )["name"]
             vals[pid] = fixed
             spec = fixed
-        tier = spec.get("tier") or "working"
+        tier = spec.get("tier") or "staging"
         name = spec.get("name") or default_output_spec(param)["name"]
         name_label = "Folder name" if ptype == "folder_output" else "Name"
         resolved = resolve_output_path(_db(), CATALOG, param, spec)
+        taken = output_destination_taken(
+            resolved, is_folder=ptype == "folder_output"
+        )
 
         with ui.column().classes("w-full q-mb-sm gap-1"):
             ui.label(label + star).classes("text-caption text-grey-5")
@@ -1085,7 +1306,7 @@ def _param_widget(
                 tier_sel = (
                     ui.select(
                         options=list(OUTPUT_TIERS),
-                        value=tier if tier in OUTPUT_TIERS else "working",
+                        value=tier if tier in OUTPUT_TIERS else "staging",
                         label="Save to",
                     )
                     .props(_field_props())
@@ -1098,6 +1319,21 @@ def _param_widget(
                 )
                 if ptype == "vector_output":
                     ui.label(VECTOR_OUTPUT_EXT).classes("qt-meta q-mt-sm")
+                elif ptype == "raster_output":
+                    ui.label(RASTER_OUTPUT_EXT).classes("qt-meta q-mt-sm")
+
+                def _refresh_path(cur: Dict[str, str]) -> None:
+                    path = resolve_output_path(_db(), CATALOG, param, cur)
+                    path_lbl.set_text(path)
+                    conflict = output_destination_taken(
+                        path, is_folder=ptype == "folder_output"
+                    )
+                    conflict_lbl.set_text(
+                        "Name already exists — pick another name or tier"
+                        if conflict
+                        else ""
+                    )
+                    conflict_lbl.set_visibility(conflict)
 
                 def on_tier(e, tool=tool_id, key=pid) -> None:
                     cur = state["values"][tool].get(key)
@@ -1106,7 +1342,7 @@ def _param_widget(
                     cur = dict(cur)
                     cur["tier"] = e.value
                     state["values"][tool][key] = cur
-                    path_lbl.set_text(resolve_output_path(_db(), CATALOG, param, cur))
+                    _refresh_path(cur)
 
                 def on_name(e, tool=tool_id, key=pid) -> None:
                     cur = state["values"][tool].get(key)
@@ -1115,11 +1351,15 @@ def _param_widget(
                     cur = dict(cur)
                     cur["name"] = output_name_stem(e.value or "")
                     state["values"][tool][key] = cur
-                    path_lbl.set_text(resolve_output_path(_db(), CATALOG, param, cur))
+                    _refresh_path(cur)
 
                 tier_sel.on_value_change(on_tier)
                 name_inp.on_value_change(on_name)
             path_lbl = ui.label(resolved).classes("qt-meta")
+            conflict_lbl = ui.label(
+                "Name already exists — pick another name or tier" if taken else ""
+            ).classes("text-negative text-caption")
+            conflict_lbl.set_visibility(taken)
         return
 
     if ptype == "boolean":
@@ -1385,6 +1625,11 @@ def render_configure_page() -> None:
         def run() -> None:
             if not _map_chosen():
                 ui.notify("Choose a map first", type="warning")
+                return
+            try:
+                _build_jobs()
+            except ValueError as exc:
+                ui.notify(str(exc), type="warning")
                 return
             state["page"] = "run"
             state["log_lines"] = []
