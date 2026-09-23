@@ -14,6 +14,7 @@ scripts/
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
   layers_alignment/      # Overlap priority: roads → water → buildings → trees
+  dtm_burn/              # Push QM under roads; road-ground clip polygons
 webapp/                  # Local browser UI over qgis_process
 Database/                # Named input/output folders for the UI
 ```
@@ -227,6 +228,19 @@ Copy **both** `assign_roof_type.py` and `roof_type_core.py` into the QGIS script
 1. Processing Toolbox → Scripts → **Add Script to Toolbox…**
 2. Select `scripts/roof_type/assign_roof_type.py`
 3. Run **QGIS Projects → Assign roof type from zones**
+
+## Road ground clip polygons
+
+Folder: [`scripts/dtm_burn/`](scripts/dtm_burn/)
+
+| File | Role |
+| --- | --- |
+| [`road_ground_clip_polygons.py`](scripts/dtm_burn/road_ground_clip_polygons.py) | QGIS Processing algorithm |
+| [`road_bump_core.py`](scripts/dtm_burn/road_bump_core.py) | Ground-vs-road overlap |
+
+Writes polygons where the quantized-mesh surface is above the 3D road mesh, for clipping ground and imagery in Unreal. The terrain tiles are not modified. Only the highest LOD in the mesh folder is used unless a LOD is set, so coarse tiles do not turn into huge clip areas. Pieces are dissolved, buffered, cut back to the road footprint, and simplified. Output is EPSG:4326 with `area_m2`.
+
+Copy `road_ground_clip_polygons.py`, `road_bump_core.py`, `qm_burn_core.py`, and `quantized_mesh.py` into the QGIS scripts folder (or copy the whole `scripts/qgis_processing/` folder after sync).
 
 ## Browser UI (local)
 

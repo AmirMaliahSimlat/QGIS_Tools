@@ -142,8 +142,11 @@ def spawn_context_for_workers(
 def _pool_initializer(scripts_root: Optional[str]) -> None:
     if not scripts_root:
         return
-    if scripts_root not in sys.path:
-        sys.path.insert(0, scripts_root)
+    # os.pathsep joins several roots (tool folder + scripts/) so workers can
+    # import both the local module and shared helpers.
+    for part in str(scripts_root).split(os.pathsep):
+        if part and part not in sys.path:
+            sys.path.insert(0, part)
 
 
 def map_in_processes(

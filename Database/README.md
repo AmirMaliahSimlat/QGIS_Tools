@@ -16,6 +16,7 @@ Database/
       masks/{staging,tests,final}/               # tool output
       outline_points/{staging,tests,final}/      # tool output
       mesh_3d/{source,staging,tests,final}/      # Unreal 3D road triangles
+      clip_polygons/{staging,tests,final}/      # ground poke-through clip masks
     water/
       footprints/{source,staging,tests,final}/   # import
       outline_points/{staging,tests,final}/      # tool output

@@ -38,6 +38,7 @@ domains:
   roads_masks: roads/masks
   roads_outline_points: roads/outline_points
   roads_mesh_3d: roads/mesh_3d
+  roads_clip_polygons: roads/clip_polygons
   water_footprints: water/footprints
   water_outline_points: water/outline_points
   quantized_mesh: elevation/quantized-mesh
@@ -54,6 +55,7 @@ domain_labels:
   roads_masks: Roads masks
   roads_outline_points: Roads outline points
   roads_mesh_3d: Roads 3D mesh
+  roads_clip_polygons: Road ground clips
   water_footprints: Water footprints
   water_outline_points: Water outline points
   quantized_mesh: Quantized mesh
@@ -344,6 +346,64 @@ tools:
         domain: quantized_mesh
         default_tier: final
         default_name: mesh_roads_burned
+        required: true
+
+  - id: road_ground_clip_polygons
+    algorithm: script:road_ground_clip_polygons
+    display_name: Road ground clip polygons
+    tabs: [roads]
+    description: >
+      Polygons where the quantized mesh rises above the 3D road surface.
+      Clip the ground and imagery with these in Unreal. The terrain is not
+      edited. Uses the highest LOD in the chosen mesh folder.
+    params:
+      - id: INPUT_ROADS
+        label: Roads 3D mesh (triangles with Z)
+        type: vector_file
+        library: roads_mesh_3d
+        required: true
+      - id: INPUT_MESH
+        label: Quantized-mesh (highest LOD)
+        type: folder
+        library: quantized_mesh
+        mesh_pick: lod
+        required: true
+      - id: MIN_PROTRUSION
+        label: Minimum protrusion (m)
+        type: number
+        default: 0.02
+        min: 0.0
+      - id: BUFFER
+        label: Buffer inside the road (m)
+        type: number
+        default: 1.0
+        min: 0.0
+      - id: SIMPLIFY
+        label: Simplify tolerance (m)
+        type: number
+        default: 1.0
+        min: 0.0
+      - id: MIN_AREA
+        label: Minimum polygon area (m²)
+        type: number
+        default: 0.25
+        min: 0.0
+      - id: LOD
+        label: LOD (-1 = highest in the folder)
+        type: integer
+        default: -1
+        min: -1
+      - id: WORKERS
+        label: Worker processes (0=auto, 1=serial)
+        type: integer
+        default: 0
+        min: 0
+      - id: OUTPUT
+        label: Road ground clip polygons
+        type: vector_output
+        domain: roads_clip_polygons
+        default_tier: final
+        default_name: road_ground_clips.shp
         required: true
 
   - id: water_outline_points
