@@ -28,6 +28,7 @@ from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFile,
     QgsProcessingParameterNumber,
@@ -49,6 +50,7 @@ from parallel_util import map_in_processes, resolve_workers  # noqa: E402
 from qm_burn_core import fan_triangles_from_ring  # noqa: E402
 from quantized_mesh import discover_terrain_tiles, tile_rectangle  # noqa: E402
 from road_bump_core import RoadGrid, process_tile_task  # noqa: E402
+from road_clip_simplify_core import RoadEdges, simplify_clips  # noqa: E402
 
 # Drop isolated crumbs before the buffer so they do not swell into clip disks.
 _PRE_BUFFER_MIN_M2 = 0.01
@@ -199,6 +201,81 @@ def _safe(geom: QgsGeometry):
     return _polygons_only(valid)
 
 
+def _open_exterior(geom: QgsGeometry):
+    if geom is None or geom.isEmpty():
+        return []
+    poly = geom.asPolygon()
+    if not poly and geom.isMultipart():
+        multi = geom.asMultiPolygon()
+        if multi:
+            poly = multi[0]
+    if not poly:
+        return []
+    pts = [(float(p.x()), float(p.y())) for p in poly[0]]
+    if (
+        len(pts) >= 2
+        and abs(pts[0][0] - pts[-1][0]) < 1e-8
+        and abs(pts[0][1] - pts[-1][1]) < 1e-8
+    ):
+        pts = pts[:-1]
+    return pts
+
+
+def _exterior_edges(geom: QgsGeometry):
+    edges = []
+    for part in _iter_polygons(geom):
+        ring = _open_exterior(part)
+        if len(ring) < 2:
+            continue
+        for i in range(len(ring)):
+            edges.append((ring[i], ring[(i + 1) % len(ring)]))
+    return edges
+
+
+def _collect(geoms):
+    clean = [g for g in geoms if g is not None and not g.isEmpty()]
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return clean[0]
+    return QgsGeometry.collectGeometry(clean)
+
+
+def _mask_in_metric(layer, metric, feedback, tr):
+    """Union the 2D road mask in ``metric``. None when no mask was given."""
+    if layer is None:
+        return None
+    xform = None
+    if layer.sourceCrs().isValid() and layer.sourceCrs() != metric:
+        xform = QgsCoordinateTransform(
+            layer.sourceCrs(), metric, QgsProject.instance()
+        )
+    parts = []
+    for feat in layer.getFeatures():
+        if feedback.isCanceled():
+            break
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        g = QgsGeometry(geom)
+        if xform is not None and g.transform(xform) != 0:
+            continue
+        g = _force_2d(g)
+        if g.isEmpty():
+            continue
+        valid = g.makeValid()
+        if valid is not None and not valid.isEmpty():
+            parts.append(valid)
+    mask = _safe(_union_all(parts))
+    if mask is None:
+        feedback.pushWarning(tr("Road mask is empty; skipping low-vertex shapes."))
+        return None
+    feedback.pushInfo(
+        tr("Low-vertex shapes stay inside the 2D road mask.")
+    )
+    return mask
+
+
 def _metric_crs(lon: float, lat: float) -> QgsCoordinateReferenceSystem:
     zone = int((lon + 180.0) / 6.0) + 1
     zone = min(60, max(1, zone))
@@ -215,14 +292,19 @@ def _transform(geom: QgsGeometry, xform: QgsCoordinateTransform):
 
 class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
     INPUT_ROADS = "INPUT_ROADS"
+    INPUT_MASK = "INPUT_MASK"
     INPUT_MESH = "INPUT_MESH"
     MIN_PROTRUSION = "MIN_PROTRUSION"
     BUFFER = "BUFFER"
     SIMPLIFY = "SIMPLIFY"
+    MERGE_GAP = "MERGE_GAP"
+    LOW_VERTEX = "LOW_VERTEX"
+    WRITE_EXACT = "WRITE_EXACT"
     MIN_AREA = "MIN_AREA"
     LOD = "LOD"
     WORKERS = "WORKERS"
     OUTPUT = "OUTPUT"
+    OUTPUT_EXACT = "OUTPUT_EXACT"
 
     def tr(self, string):
         return QCoreApplication.translate("Processing", string)
@@ -250,8 +332,16 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
             "A bump is the part of each ground triangle that is higher than "
             "the road plane by at least the minimum protrusion, cut to the "
             "road footprint. Touching pieces are dissolved. Buffer grows them "
-            "slightly, then cuts them back to the road so the shoulder outside "
-            "the road is not clipped. Simplify reduces vertices for Unreal.\n\n"
+            "slightly, then cuts them back to the road.\n\n"
+            "With a 2D road mask, each bump is replaced by a road-aligned "
+            "rectangle when that rectangle stays inside the mask. When it "
+            "would stick out, the rectangle is cut to the mask and corners "
+            "are removed until dropping another one would uncover the bump "
+            "or leave the road. Nearby bumps merge when one simpler shape "
+            "covers both and has fewer corners. Turn simplification off to "
+            "keep those exact bumps. Optionally write them to a second "
+            "shapefile while the main output stays simplified. Without a "
+            "mask, Douglas-Peucker is used instead.\n\n"
             "LOD -1 uses only the highest level in the mesh folder. Coarser "
             "levels are skipped because their large triangles would mark long "
             "stretches of road.\n\n"
@@ -265,6 +355,14 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
                 self.INPUT_ROADS,
                 self.tr("Roads 3D mesh (triangle polygons with Z)"),
                 [QgsProcessing.TypeVectorPolygon],
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterVectorLayer(
+                self.INPUT_MASK,
+                self.tr("Road mask (clip must stay inside)"),
+                [QgsProcessing.TypeVectorPolygon],
+                optional=True,
             )
         )
         self.addParameter(
@@ -295,10 +393,33 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.SIMPLIFY,
-                self.tr("Simplify tolerance (m)"),
+                self.tr("Simplify tolerance (m, used only without a road mask)"),
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=1.0,
                 minValue=0.0,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.MERGE_GAP,
+                self.tr("Merge bumps up to this far apart (m)"),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=100.0,
+                minValue=0.0,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.LOW_VERTEX,
+                self.tr("Simplify clip polygons"),
+                defaultValue=True,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.WRITE_EXACT,
+                self.tr("Also save exact bump polygons"),
+                defaultValue=False,
             )
         )
         self.addParameter(
@@ -334,15 +455,116 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
                 self.tr("Road ground clip polygons"),
             )
         )
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_EXACT,
+                self.tr("Exact bump polygons"),
+                optional=True,
+            )
+        )
+
+    def _low_vertex_clips(self, dissolved, mask_metric, merge_gap, feedback):
+        if dissolved is None or dissolved.isEmpty():
+            return None
+        bump_rings = []
+        for part in _iter_polygons(dissolved):
+            ring = _open_exterior(part)
+            if len(ring) >= 3:
+                bump_rings.append(ring)
+        if not bump_rings:
+            return None
+        before = sum(len(ring) for ring in bump_rings)
+        edges = _exterior_edges(mask_metric)
+        frame = RoadEdges(edges)
+
+        def contains_fn(ring):
+            geom = _ring_geom(ring)
+            if geom.isEmpty():
+                return False
+            if not geom.isGeosValid():
+                geom = geom.makeValid()
+                if geom is None or geom.isEmpty():
+                    return False
+            diff = geom.difference(mask_metric)
+            if diff is None or diff.isEmpty():
+                return True
+            try:
+                return float(diff.area()) <= 0.05
+            except Exception:
+                return False
+
+        def intersect_fn(ring):
+            geom = _ring_geom(ring)
+            if geom.isEmpty():
+                return []
+            inter = geom.intersection(mask_metric)
+            if inter is None or inter.isEmpty():
+                return []
+            valid = inter.makeValid()
+            if valid is None or valid.isEmpty():
+                return []
+            out = []
+            for part in _iter_polygons(valid):
+                exterior = _open_exterior(part)
+                if len(exterior) >= 3:
+                    out.append(exterior)
+            return out
+
+        feedback.setProgressText(self.tr("Fitting low-vertex clip shapes…"))
+        shapes = simplify_clips(
+            bump_rings,
+            merge_gap,
+            contains_fn,
+            frame.angle_for,
+            intersect_fn,
+        )
+        geoms = []
+        for shape in shapes:
+            geom = _ring_geom(shape)
+            if not geom.isEmpty():
+                geoms.append(geom)
+        after = sum(len(shape) for shape in shapes)
+        feedback.pushInfo(
+            self.tr(
+                f"Low-vertex clips: {len(bump_rings)} parts, {before} vertices "
+                f"→ {len(shapes)} parts, {after} vertices."
+            )
+        )
+        return _collect(geoms)
+
+    def _write_polygons(self, sink, fields, geom, to_wgs, min_area, feedback):
+        written = 0
+        if geom is None:
+            return written, False
+        for part in _iter_polygons(geom):
+            if feedback.isCanceled():
+                return written, True
+            area = float(part.area())
+            if area < min_area:
+                continue
+            out_geom = _force_2d(part)
+            out_geom = _transform(out_geom, to_wgs)
+            if out_geom is None or out_geom.isEmpty():
+                continue
+            feat = QgsFeature(fields)
+            feat.setGeometry(out_geom)
+            feat.setAttributes([area])
+            sink.addFeature(feat, QgsFeatureSink.FastInsert)
+            written += 1
+        return written, False
 
     def processAlgorithm(self, parameters, context, feedback):
         roads = self.parameterAsVectorLayer(parameters, self.INPUT_ROADS, context)
+        mask = self.parameterAsVectorLayer(parameters, self.INPUT_MASK, context)
         mesh_in = self.parameterAsFile(parameters, self.INPUT_MESH, context)
         min_protrusion = float(
             self.parameterAsDouble(parameters, self.MIN_PROTRUSION, context)
         )
         buffer_m = float(self.parameterAsDouble(parameters, self.BUFFER, context))
         simplify_m = float(self.parameterAsDouble(parameters, self.SIMPLIFY, context))
+        merge_gap = float(self.parameterAsDouble(parameters, self.MERGE_GAP, context))
+        low_vertex = bool(self.parameterAsBool(parameters, self.LOW_VERTEX, context))
+        write_exact = bool(self.parameterAsBool(parameters, self.WRITE_EXACT, context))
         min_area = float(self.parameterAsDouble(parameters, self.MIN_AREA, context))
         lod = int(self.parameterAsInt(parameters, self.LOD, context))
         workers_req = int(self.parameterAsInt(parameters, self.WORKERS, context))
@@ -354,12 +576,19 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
 
         try:
             sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
+            exact_params, exact_atomic = (None, None)
+            if write_exact:
+                exact_params, exact_atomic = begin_atomic_file_output(
+                    parameters, self.OUTPUT_EXACT
+                )
         except FileExistsError as exc:
             raise QgsProcessingException(str(exc)) from exc
 
         ok = False
         sink = None
         dest_id = None
+        exact_sink = None
+        exact_dest_id = None
         canceled = False
         try:
             wgs84 = epsg_4326()
@@ -481,7 +710,7 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
                 self.tr(
                     f"Tiles overlapping roads: {len(tasks)}. "
                     f"Protrusion ≥ {min_protrusion:g} m, buffer {buffer_m:g} m, "
-                    f"simplify {simplify_m:g} m, min area {min_area:g} m²."
+                    f"merge gap {merge_gap:g} m, min area {min_area:g} m²."
                 )
             )
 
@@ -536,7 +765,7 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
             to_metric = QgsCoordinateTransform(wgs84, metric, QgsProject.instance())
             to_wgs = QgsCoordinateTransform(metric, wgs84, QgsProject.instance())
             feedback.pushInfo(
-                self.tr(f"Buffer and simplify in {metric.authid()}.")
+                self.tr(f"Measuring buffers in {metric.authid()}.")
             )
 
             pre_floor = _PRE_BUFFER_MIN_M2
@@ -559,7 +788,19 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
                         grown = _safe(grown.intersection(foot_m))
                 dissolved = grown
 
-            if dissolved is not None and simplify_m > 0.0:
+            mask_metric = _mask_in_metric(mask, metric, feedback, self.tr)
+            if dissolved is not None and mask_metric is not None:
+                dissolved = _safe(dissolved.intersection(mask_metric))
+            exact_geom = dissolved
+            if not low_vertex:
+                feedback.pushInfo(
+                    self.tr("Simplification is off. Writing the exact bump polygons.")
+                )
+            elif dissolved is not None and mask_metric is not None:
+                dissolved = self._low_vertex_clips(
+                    dissolved, mask_metric, merge_gap, feedback
+                )
+            elif dissolved is not None and simplify_m > 0.0:
                 simplified = dissolved.simplify(simplify_m)
                 dissolved = _safe(simplified if simplified is not None else dissolved)
 
@@ -576,24 +817,26 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
             if sink is None:
                 raise QgsProcessingException(self.tr("Could not create output sink."))
 
-            written = 0
-            if dissolved is not None:
-                for part in _iter_polygons(dissolved):
-                    if feedback.isCanceled():
-                        canceled = True
-                        break
-                    area = float(part.area())
-                    if area < min_area:
-                        continue
-                    out_geom = _force_2d(part)
-                    out_geom = _transform(out_geom, to_wgs)
-                    if out_geom is None or out_geom.isEmpty():
-                        continue
-                    feat = QgsFeature(fields)
-                    feat.setGeometry(out_geom)
-                    feat.setAttributes([area])
-                    sink.addFeature(feat, QgsFeatureSink.FastInsert)
-                    written += 1
+            written, canceled = self._write_polygons(
+                sink, fields, dissolved, to_wgs, min_area, feedback
+            )
+            exact_written = 0
+            if write_exact and not canceled:
+                exact_sink, exact_dest_id = self.parameterAsSink(
+                    exact_params if exact_params is not None else parameters,
+                    self.OUTPUT_EXACT,
+                    context,
+                    fields,
+                    QgsWkbTypes.Polygon,
+                    wgs84,
+                )
+                if exact_sink is None:
+                    raise QgsProcessingException(
+                        self.tr("Could not create the exact-bump output.")
+                    )
+                exact_written, canceled = self._write_polygons(
+                    exact_sink, fields, exact_geom, to_wgs, min_area, feedback
+                )
 
             if canceled:
                 raise QgsProcessingException(self.tr("Canceled."))
@@ -602,7 +845,13 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
                 self.tr(
                     f"Raw overlap pieces: {raw_rings}. "
                     f"Wrote {written} clip polygon(s)"
-                    f"{f' ({tile_errors} tile warnings)' if tile_errors else ''}."
+                    + (
+                        f" and {exact_written} exact bump polygon(s)"
+                        if write_exact
+                        else ""
+                    )
+                    + (f" ({tile_errors} tile warnings)" if tile_errors else "")
+                    + "."
                 )
             )
             if written == 0:
@@ -615,6 +864,7 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
             ok = True
             feedback.setProgress(100)
             result_id = dest_id
+            exact_result_id = exact_dest_id
         finally:
             published = finish_or_abandon(
                 atomic,
@@ -623,5 +873,16 @@ class RoadGroundClipPolygonsAlgorithm(QgsProcessingAlgorithm):
                 context=context,
                 dest_id=dest_id,
             )
+            exact_published = finish_or_abandon(
+                exact_atomic,
+                ok=ok,
+                sink=exact_sink,
+                context=context,
+                dest_id=exact_dest_id,
+            )
             sink = None
-        return {self.OUTPUT: published or result_id}
+            exact_sink = None
+        outputs = {self.OUTPUT: published or result_id}
+        if write_exact:
+            outputs[self.OUTPUT_EXACT] = exact_published or exact_result_id
+        return outputs

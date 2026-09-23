@@ -853,6 +853,8 @@ def _build_jobs() -> List[Dict[str, Any]]:
 
         params: Dict[str, object] = {}
         for p in tool.get("params", []):
+            if not _param_enabled(tid, p, raw):
+                continue
             pid = p["id"]
             val = raw.get(pid)
             if pid in (wires.get(tid) or {}):
@@ -1196,12 +1198,24 @@ def render_select_page() -> None:
             queue_panel()
 
 
+def _param_enabled(tool_id: str, param: Dict[str, Any], raw: Optional[Dict[str, Any]] = None) -> bool:
+    """False when a catalog ``enabled_by`` switch is off."""
+    gate = param.get("enabled_by")
+    if not gate:
+        return True
+    if raw is None:
+        raw = state["values"].get(tool_id) or {}
+    return bool(raw.get(gate))
+
+
 def _param_widget(
     tool_id: str,
     param: Dict[str, Any],
     *,
     wired_from: Optional[tuple] = None,
 ) -> None:
+    if not _param_enabled(tool_id, param):
+        return
     vals = state["values"][tool_id]
     pid = param["id"]
     ptype = param["type"]
@@ -1375,6 +1389,11 @@ def _param_widget(
 
             def on_bool(e, tool=tool_id, key=pid) -> None:
                 state["values"][tool][key] = bool(e.value)
+                tool_def = tool_by_id(CATALOG, tool)
+                if tool_def and any(
+                    p.get("enabled_by") == key for p in tool_def.get("params") or []
+                ):
+                    render_body.refresh()
 
             sw.on_value_change(on_bool)
             _set_as_default_button(tool_id, param)

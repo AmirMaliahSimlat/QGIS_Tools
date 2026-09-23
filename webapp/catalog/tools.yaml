@@ -354,13 +354,21 @@ tools:
     tabs: [roads]
     description: >
       Polygons where the quantized mesh rises above the 3D road surface.
-      Clip the ground and imagery with these in Unreal. The terrain is not
-      edited. Uses the highest LOD in the chosen mesh folder.
+      With simplification on, each patch becomes a road-aligned rectangle
+      when that fits inside the road mask. Otherwise the rectangle is cut
+      to the mask and extra corners are removed. Nearby patches merge when
+      one simpler shape covers both. Turn simplification off to keep the
+      exact bumps, or also save those exact polygons beside the simplified ones.
     params:
       - id: INPUT_ROADS
         label: Roads 3D mesh (triangles with Z)
         type: vector_file
         library: roads_mesh_3d
+        required: true
+      - id: INPUT_MASK
+        label: Road mask (clip stays inside)
+        type: vector_file
+        library: roads_masks
         required: true
       - id: INPUT_MESH
         label: Quantized-mesh (highest LOD)
@@ -378,11 +386,20 @@ tools:
         type: number
         default: 1.0
         min: 0.0
-      - id: SIMPLIFY
-        label: Simplify tolerance (m)
+      - id: MERGE_GAP
+        label: Merge bumps up to this far apart (m)
         type: number
-        default: 1.0
+        default: 100.0
         min: 0.0
+        enabled_by: LOW_VERTEX
+      - id: LOW_VERTEX
+        label: Simplify clip polygons
+        type: boolean
+        default: true
+      - id: WRITE_EXACT
+        label: Also save exact bump polygons
+        type: boolean
+        default: false
       - id: MIN_AREA
         label: Minimum polygon area (m²)
         type: number
@@ -405,6 +422,14 @@ tools:
         default_tier: final
         default_name: road_ground_clips.shp
         required: true
+      - id: OUTPUT_EXACT
+        label: Exact bump polygons
+        type: vector_output
+        domain: roads_clip_polygons
+        default_tier: final
+        default_name: road_ground_bumps_exact.shp
+        required: false
+        enabled_by: WRITE_EXACT
 
   - id: water_outline_points
     algorithm: script:polygon_mask_points

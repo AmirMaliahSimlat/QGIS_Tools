@@ -43,6 +43,7 @@ DEPLOY_FILES = [
     ("dtm_burn/qm_burn_core.py", "qm_burn_core.py"),
     ("dtm_burn/road_ground_clip_polygons.py", "road_ground_clip_polygons.py"),
     ("dtm_burn/road_bump_core.py", "road_bump_core.py"),
+    ("dtm_burn/road_clip_simplify_core.py", "road_clip_simplify_core.py"),
 ]
 
 

@@ -237,10 +237,11 @@ Folder: [`scripts/dtm_burn/`](scripts/dtm_burn/)
 | --- | --- |
 | [`road_ground_clip_polygons.py`](scripts/dtm_burn/road_ground_clip_polygons.py) | QGIS Processing algorithm |
 | [`road_bump_core.py`](scripts/dtm_burn/road_bump_core.py) | Ground-vs-road overlap |
+| [`road_clip_simplify_core.py`](scripts/dtm_burn/road_clip_simplify_core.py) | Low-vertex shapes inside the road mask |
 
-Writes polygons where the quantized-mesh surface is above the 3D road mesh, for clipping ground and imagery in Unreal. The terrain tiles are not modified. Only the highest LOD in the mesh folder is used unless a LOD is set, so coarse tiles do not turn into huge clip areas. Pieces are dissolved, buffered, cut back to the road footprint, and simplified. Output is EPSG:4326 with `area_m2`.
+Writes polygons where the quantized-mesh surface is above the 3D road mesh, for clipping ground and imagery in Unreal. The terrain tiles are not modified. Only the highest LOD in the mesh folder is used unless a LOD is set. Detection and simplification are one run. With simplification on and a 2D road mask, each bump becomes a road-aligned rectangle when that rectangle stays inside the mask. When the rectangle would stick out, it is cut to the mask and corners are dropped until the shape still covers the bump and stays on the road. Bumps within the merge distance become one shape when that shape has fewer corners. Turn simplification off to write those exact bumps as the main output. Turn on “Also save exact bump polygons” to write a second shapefile of the bumps before simplification. Output is EPSG:4326 with `area_m2`.
 
-Copy `road_ground_clip_polygons.py`, `road_bump_core.py`, `qm_burn_core.py`, and `quantized_mesh.py` into the QGIS scripts folder (or copy the whole `scripts/qgis_processing/` folder after sync).
+Copy `road_ground_clip_polygons.py`, `road_bump_core.py`, `road_clip_simplify_core.py`, `qm_burn_core.py`, and `quantized_mesh.py` into the QGIS scripts folder (or copy the whole `scripts/qgis_processing/` folder after sync).
 
 ## Browser UI (local)
 
