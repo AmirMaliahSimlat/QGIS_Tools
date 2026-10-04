@@ -67,6 +67,7 @@ source_domains:
   - buildings_footprints
   - trees_footprints
   - roads_vectors
+  - roads_masks
   - roads_mesh_3d
   - water_footprints
   - quantized_mesh
@@ -103,6 +104,9 @@ pipelines:
     label: Roads
     steps:
       - id: polygon_mask_points
+      - id: road_ground_clip_polygons
+      - id: simplify_bump_polygons
+      - id: flatten_qm_bumps
 
 tools:
   - id: tree_mask_to_points
@@ -174,6 +178,9 @@ tools:
     display_name: Trees RGB
     tabs: [trees]
     description: Sample R/G/B from imagery and attach to tree points.
+    writes_fields:
+      - input: INPUT_POINTS
+        fields: [R, G, B]
     params:
       - id: INPUT_POINTS
         label: Tree points
@@ -197,7 +204,10 @@ tools:
     algorithm: script:building_altitude_and_height
     display_name: Buildings altitude and height
     tabs: [buildings]
-    description: Add altitude, max_altitude, and random height from mesh.
+    description: Add altitude and random height from mesh (max mesh used only for height).
+    writes_fields:
+      - input: INPUT_BUILDINGS
+        fields: [altitude, height]
     params:
       - id: INPUT_BUILDINGS
         label: Buildings footprints
@@ -239,7 +249,13 @@ tools:
     algorithm: script:assign_roof_type
     display_name: Buildings roof types
     tabs: [buildings]
-    description: Assign roof_type from zone polygons.
+    description: >
+      Assign roof_type from zone polygons. Use Mark zones on Configure to draw
+      zones on a map (streamed imagery + footprints), then select the saved
+      zones shapefile here.
+    writes_fields:
+      - input: INPUT_BUILDINGS
+        fields: [roof_type]
     params:
       - id: INPUT_BUILDINGS
         label: Buildings footprints
@@ -268,8 +284,12 @@ tools:
     display_name: Roads mask to outline points
     tabs: [roads]
     description: >
-      Densify road-mask outlines to PointZ samples with mesh altitude
-      (same engine as water outline points).
+      Sample road-mask outlines to PointZ with mesh altitude
+      (same engine as water outline points). Points are placed every N
+      meters, with an optional point wherever a quantized-mesh edge
+      crosses the outline. Or copy the mask vertices, still with that
+      optional crossing. A minimum separation in millimetres drops the
+      later of two consecutive outline points that are closer than that.
     params:
       - id: INPUT_POLYGONS
         label: Road mask polygons
@@ -282,11 +302,25 @@ tools:
         library: quantized_mesh
         mesh_pick: lod
         required: true
+      - id: USE_MASK_VERTICES
+        label: Use only mask vertices
+        type: boolean
+        default: false
       - id: SPACING
         label: Outline point spacing (m)
         type: number
         default: 5.0
         min: 0.01
+        enabled_by_off: USE_MASK_VERTICES
+      - id: MIN_SEPARATION_MM
+        label: Remove a point closer than (mm)
+        type: number
+        default: 0.0
+        min: 0.0
+      - id: ADD_QM_CROSSINGS
+        label: Add a point where a QM edge crosses the outline
+        type: boolean
+        default: true
       - id: ADD_CENTER_POINTS
         label: Add center points (legacy)
         type: boolean
@@ -296,11 +330,15 @@ tools:
         type: enum
         options: ["Sparse grid (legacy)", "Chord midpoints (legacy)"]
         default: 0
+        enabled_by: ADD_CENTER_POINTS
       - id: CENTER_GRID_SPACING
         label: Center grid spacing (m, legacy)
         type: number
         default: 5.0
         min: 0.01
+        enabled_by: ADD_CENTER_POINTS
+        enabled_when:
+          CENTER_MODE: 0
       - id: WORKERS
         label: Worker processes (0=auto, 1=serial)
         type: integer
@@ -314,20 +352,31 @@ tools:
         default_name: road_outline_points.shp
         required: true
 
-  - id: burn_roads_into_quantized_mesh
-    algorithm: script:burn_roads_into_quantized_mesh
-    display_name: Push QM under 3D roads (poke-through only)
+  - id: flatten_qm_bumps
+    algorithm: script:flatten_qm_bumps
+    display_name: Lower QM ground under bumps
     tabs: [roads]
     description: >
-      Lower quantized-mesh vertices that poke through a Unreal 3D road mesh
-      (all LODs). At each in-mask vertex not on a straddling QM triangle:
-      target = road plane Z − clearance; new = min(old, target). Rim vertices
-      on triangles that also have an outside corner are never lowered.
+      Inserts bump polygons into the highest quantized-mesh LOD and lowers
+      the ground under them. Each bump outline is cut into the mesh. An
+      original edge that crosses the outline stops there. The mesh outside
+      the outline keeps its height. Inside, each convex piece gets one new
+      vertex at the lowest outline height, and the triangles fan out to the
+      outline. A concave bump gets one vertex per piece. Straight fan height
+      instead places each inner vertex at the lowest straight profile of its
+      fan-edge pairs, so every pair stays a valley. Depth below boundary
+      drops those vertices further below whichever height was chosen.
+      Lower LODs are copied through unchanged.
     params:
-      - id: INPUT_ROADS
-        label: Roads 3D mesh (triangles with Z)
+      - id: INPUT_BUMPS
+        label: Simplified bump polygons
         type: vector_file
-        library: roads_mesh_3d
+        library: roads_clip_polygons
+        required: true
+      - id: INPUT_MASK
+        label: Road mask
+        type: vector_file
+        library: roads_masks
         required: true
       - id: INPUT_MESH
         label: Quantized-mesh tileset
@@ -335,17 +384,21 @@ tools:
         library: quantized_mesh
         mesh_pick: tileset
         required: true
-      - id: OFFSET_DOWN
-        label: Under-road clearance (m)
+      - id: BURY_DEPTH
+        label: Depth below boundary (m)
         type: number
-        default: 0.05
+        default: 0.0
         min: 0.0
+      - id: STRAIGHT_FAN
+        label: Straight fan height
+        type: boolean
+        default: false
       - id: OUTPUT_MESH
         label: Output quantized-mesh tileset
         type: folder_output
         domain: quantized_mesh
         default_tier: final
-        default_name: mesh_roads_burned
+        default_name: mesh_bumps_flattened
         required: true
 
   - id: road_ground_clip_polygons
@@ -354,11 +407,15 @@ tools:
     tabs: [roads]
     description: >
       Polygons where the quantized mesh rises above the 3D road surface.
-      With simplification on, each patch becomes a road-aligned rectangle
-      when that fits inside the road mask. Otherwise the rectangle is cut
-      to the mask and extra corners are removed. Nearby patches merge when
-      one simpler shape covers both. Turn simplification off to keep the
-      exact bumps, or also save those exact polygons beside the simplified ones.
+      Samples verts under the 3D road (and inside the 2D mask clipped to that
+      footprint). The output is those exact height contours. The mask only
+      limits which tiles are searched; it does not clip the polygons.
+      Shape simplification is the separate Simplify bump polygons tool.
+      Optional: replace each 3D road vertex height with the QM height at
+      that lon/lat plus an offset in centimetres. Set LOD min/max to the
+      inclusive mesh levels to process (e.g. 0–13). Each level writes
+      name_lodN.shp. Pick the full quantized-mesh tileset when the range
+      spans more than one level.
     params:
       - id: INPUT_ROADS
         label: Roads 3D mesh (triangles with Z)
@@ -366,47 +423,46 @@ tools:
         library: roads_mesh_3d
         required: true
       - id: INPUT_MASK
-        label: Road mask (clip stays inside)
+        label: Road mask (limits tile search)
         type: vector_file
         library: roads_masks
         required: true
       - id: INPUT_MESH
-        label: Quantized-mesh (highest LOD)
+        label: Quantized-mesh tileset (all LODs)
         type: folder
         library: quantized_mesh
-        mesh_pick: lod
+        mesh_pick: tileset
         required: true
       - id: MIN_PROTRUSION
         label: Minimum protrusion (m)
         type: number
         default: 0.02
         min: 0.0
-      - id: BUFFER
-        label: Buffer inside the road (m)
-        type: number
-        default: 1.0
-        min: 0.0
-      - id: MERGE_GAP
-        label: Merge bumps up to this far apart (m)
-        type: number
-        default: 100.0
-        min: 0.0
-        enabled_by: LOW_VERTEX
-      - id: LOW_VERTEX
-        label: Simplify clip polygons
-        type: boolean
-        default: true
-      - id: WRITE_EXACT
-        label: Also save exact bump polygons
-        type: boolean
-        default: false
       - id: MIN_AREA
         label: Minimum polygon area (m²)
         type: number
         default: 0.25
         min: 0.0
-      - id: LOD
-        label: LOD (-1 = highest in the folder)
+      - id: SAMPLE_EDGES
+        label: Sample mesh edges & centroids (slower)
+        type: boolean
+        default: true
+      - id: USE_QM_ROAD_Z
+        label: Use QM altitude for the 3D road
+        type: boolean
+        default: false
+      - id: ROAD_Z_OFFSET_CM
+        label: Road offset above QM (cm)
+        type: number
+        default: 10
+        enabled_by: USE_QM_ROAD_Z
+      - id: LOD_MIN
+        label: LOD min (inclusive)
+        type: integer
+        default: 0
+        min: 0
+      - id: LOD_MAX
+        label: LOD max (inclusive; -1 = highest)
         type: integer
         default: -1
         min: -1
@@ -422,22 +478,75 @@ tools:
         default_tier: final
         default_name: road_ground_clips.shp
         required: true
-      - id: OUTPUT_EXACT
+
+  - id: simplify_bump_polygons
+    algorithm: script:simplify_bump_polygons
+    display_name: Simplify bump polygons
+    tabs: [roads]
+    description: >
+      Separate from bump detection. Dissolves exact bumps that touch, then
+      replaces each part with its convex hull when that hull lies inside
+      the 2D road mask. Nearby separate bumps share one hull when that
+      combined hull still lies inside the road. Parts whose hull leaves
+      the road still lose corners whose shortcut stays inside the road.
+      Turn on edge extension to drop more hull
+      corners when the added patch still lies in the road.
+      Simplified polygons that overlap are then unioned into one
+      polygon, without taking a new convex hull.
+      Turn on enlarge to slide each polygon's edges outward by a
+      distance (default 1 m) so the corners stay sharp. The whole
+      polygon uses that one distance. It grows less when any point
+      would come within the margin (default 0.5 m) of the road outline.
+    params:
+      - id: INPUT_BUMPS
         label: Exact bump polygons
+        type: vector_file
+        library: roads_clip_polygons
+        required: true
+      - id: INPUT_MASK
+        label: Road mask (result stays inside)
+        type: vector_file
+        library: roads_masks
+        required: true
+      - id: EXTEND_EDGES
+        label: Extend edges to drop more vertices
+        type: boolean
+        default: false
+      - id: ENLARGE
+        label: Enlarge polygons inside the road
+        type: boolean
+        default: false
+      - id: ENLARGE_M
+        label: Enlarge by (m)
+        type: number
+        default: 1.0
+        min: 0.0
+        enabled_by: ENLARGE
+      - id: MARGIN_M
+        label: Margin from the road outline (m)
+        type: number
+        default: 0.5
+        min: 0.0
+        enabled_by: ENLARGE
+      - id: OUTPUT
+        label: Simplified bump polygons
         type: vector_output
         domain: roads_clip_polygons
-        default_tier: final
-        default_name: road_ground_bumps_exact.shp
-        required: false
-        enabled_by: WRITE_EXACT
+        default_tier: tests
+        default_name: road_bumps_simplified.shp
+        required: true
 
   - id: water_outline_points
     algorithm: script:polygon_mask_points
     display_name: Water mask to outline points
     tabs: [water]
     description: >
-      Densify water-mask outlines to PointZ samples with mesh altitude
-      (same engine as road outline points).
+      Sample water-mask outlines to PointZ with mesh altitude
+      (same engine as road outline points). Points are placed every N
+      meters, or the mask vertices are copied. Mesh-edge crossings can
+      still be added in either case. A minimum separation in millimetres
+      drops the later of two consecutive outline points that are closer
+      than that.
     params:
       - id: INPUT_POLYGONS
         label: Water mask polygons
@@ -450,11 +559,25 @@ tools:
         library: quantized_mesh
         mesh_pick: lod
         required: true
+      - id: USE_MASK_VERTICES
+        label: Use only mask vertices
+        type: boolean
+        default: false
       - id: SPACING
         label: Outline point spacing (m)
         type: number
         default: 5.0
         min: 0.01
+        enabled_by_off: USE_MASK_VERTICES
+      - id: MIN_SEPARATION_MM
+        label: Remove a point closer than (mm)
+        type: number
+        default: 0.0
+        min: 0.0
+      - id: ADD_QM_CROSSINGS
+        label: Add a point where a QM edge crosses the outline
+        type: boolean
+        default: false
       - id: ADD_CENTER_POINTS
         label: Add center points (legacy)
         type: boolean
@@ -464,11 +587,15 @@ tools:
         type: enum
         options: ["Sparse grid (legacy)", "Chord midpoints (legacy)"]
         default: 0
+        enabled_by: ADD_CENTER_POINTS
       - id: CENTER_GRID_SPACING
         label: Center grid spacing (m, legacy)
         type: number
         default: 5.0
         min: 0.01
+        enabled_by: ADD_CENTER_POINTS
+        enabled_when:
+          CENTER_MODE: 0
       - id: WORKERS
         label: Worker processes (0=auto, 1=serial)
         type: integer

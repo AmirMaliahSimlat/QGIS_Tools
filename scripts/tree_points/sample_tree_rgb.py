@@ -139,11 +139,27 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.tr("Invalid points layer."))
         if not folder or not os.path.isdir(folder):
             raise QgsProcessingException(self.tr("Invalid imagery folder."))
-        for name in (R_FIELD, G_FIELD, B_FIELD):
-            if points.fields().indexOf(name) >= 0:
-                raise QgsProcessingException(
-                    self.tr(f"Points layer already has '{name}'.")
+
+        target_names = (R_FIELD, G_FIELD, B_FIELD)
+        src_fields = points.fields()
+        keep_indices = []
+        fields = QgsFields()
+        for i in range(src_fields.count()):
+            name = src_fields.at(i).name()
+            if name in target_names:
+                continue
+            fields.append(src_fields.at(i))
+            keep_indices.append(i)
+        overwritten = [n for n in target_names if src_fields.indexOf(n) >= 0]
+        if overwritten:
+            feedback.pushInfo(
+                self.tr(
+                    "Overwriting existing field(s): " + ", ".join(overwritten)
                 )
+            )
+        fields.append(QgsField(R_FIELD, QVariant.Int))
+        fields.append(QgsField(G_FIELD, QVariant.Int))
+        fields.append(QgsField(B_FIELD, QVariant.Int))
 
         paths = list_tiff_files(folder)
         if not paths:
@@ -208,11 +224,6 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
                 cache.popitem(last=False)
             return layer
 
-        fields = QgsFields(points.fields())
-        fields.append(QgsField(R_FIELD, QVariant.Int))
-        fields.append(QgsField(G_FIELD, QVariant.Int))
-        fields.append(QgsField(B_FIELD, QVariant.Int))
-
         sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
         (sink, dest_id) = self.parameterAsSink(
             sink_params,
@@ -256,7 +267,7 @@ class SampleTreeRgbAlgorithm(QgsProcessingAlgorithm):
             if out_geom is None:
                 skipped_crs += 1
                 continue
-            attrs = list(feature.attributes())
+            attrs = [feature.attributes()[i] for i in keep_indices]
             attrs.extend([r, g, b])
             out = QgsFeature(fields)
             out.setGeometry(out_geom)

@@ -34,16 +34,20 @@ DEPLOY_FILES = [
     ("tree_points/rgb_core.py", "rgb_core.py"),
     ("building_altitude/building_altitude_and_height.py", "building_altitude_and_height.py"),
     ("mask_points/polygon_mask_points.py", "polygon_mask_points.py"),
+    ("mask_points/outline_qm_crossings.py", "outline_qm_crossings.py"),
     ("roof_type/assign_roof_type.py", "assign_roof_type.py"),
     ("roof_type/roof_type_core.py", "roof_type_core.py"),
     ("layers_alignment/layers_alignment.py", "layers_alignment.py"),
     ("line_of_sight/line_of_sight_checker.py", "line_of_sight_checker.py"),
     ("line_of_sight/los_core.py", "los_core.py"),
-    ("dtm_burn/burn_roads_into_quantized_mesh.py", "burn_roads_into_quantized_mesh.py"),
     ("dtm_burn/qm_burn_core.py", "qm_burn_core.py"),
     ("dtm_burn/road_ground_clip_polygons.py", "road_ground_clip_polygons.py"),
     ("dtm_burn/road_bump_core.py", "road_bump_core.py"),
     ("dtm_burn/road_clip_simplify_core.py", "road_clip_simplify_core.py"),
+    ("dtm_burn/bump_simplify_core.py", "bump_simplify_core.py"),
+    ("dtm_burn/simplify_bump_polygons.py", "simplify_bump_polygons.py"),
+    ("dtm_burn/flatten_qm_bumps.py", "flatten_qm_bumps.py"),
+    ("dtm_burn/qm_bump_flatten_core.py", "qm_bump_flatten_core.py"),
 ]
 
 

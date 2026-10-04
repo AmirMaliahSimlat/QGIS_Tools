@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 
 LogFn = Callable[[str], None]
@@ -22,10 +22,24 @@ ProgressFn = Callable[[Dict[str, object]], None]
 _PROGRESS_MILESTONE = re.compile(r"(?<!\d)(10|20|30|40|50|60|70|80|90|100)(?!\d)")
 _PROGRESS_DONE = re.compile(r"100\s*-\s*done", re.I)
 # Algorithm stage lines like: Placing points... 1451/205835 polygons (...)
+# Also accept "Road bump tiles: 12/340" (unit before the fraction).
 _FRACTION_PROGRESS = re.compile(
-    r"(?P<cur>\d+)\s*/\s*(?P<total>\d+)\s+(?P<unit>polygons?|tiles?|points?)\b",
+    r"(?P<cur>\d+)\s*/\s*(?P<total>\d+)\s+"
+    r"(?P<unit>polygons?|tiles?|points?|roads?|tasks?|parts?|pairs?|steps?|chunks?)\b",
     re.I,
 )
+_FRACTION_PROGRESS_LABELED = re.compile(
+    r"(?P<unit>polygons?|tiles?|points?|roads?|tasks?|parts?|pairs?|steps?|chunks?)\s*[:\-]\s*"
+    r"(?P<cur>\d+)\s*/\s*(?P<total>\d+)\b",
+    re.I,
+)
+_FRACTION_ANY = re.compile(r"\d+\s*/\s*\d+")
+# Multi-LOD stage lines: "LOD 14 (3/15): processing tiles: 12/40 tiles"
+_LOD_INDEX = re.compile(
+    r"LOD\s+\d+\s*\(\s*(?P<li>\d+)\s*/\s*(?P<n>\d+)\s*\)",
+    re.I,
+)
+
 _PROBE_DETAIL = re.compile(
     r"#(?P<idx>\d+):\s*(?P<probes>\d+)\s+probes,\s*(?P<hits>\d+)\s+hits,\s*(?P<secs>\d+)s",
     re.I,
@@ -38,7 +52,9 @@ _STAGE_HINT = re.compile(
     r"loading|loaded|algorithm|providers?|plugins?|"
     r"opening|preparing|sampling|placing|writing|copying|"
     r"flatten|indexing|using|found|kept|patched|discover|"
-    r"worker|tile|mesh|polygon|point|centroid"
+    r"worker|tile|mesh|polygon|point|centroid|"
+    r"collecting|dissolv|buffer|simplif|merging|selecting|"
+    r"processing|fitting|lod\b"
     r")\b"
 )
 # Python warnings / code frames must never become the live stage label.
@@ -65,6 +81,7 @@ class RunResult:
     command: List[str]
     stdout: str
     stderr: str
+    canceled: bool = False
 
 
 @dataclass
@@ -152,6 +169,12 @@ class _StreamProgress:
         self._last_logged_stage = ""
         self._chunks: List[str] = []
         self._lock = threading.Lock()
+        # Multi-LOD: 1-based index into the current algorithm LOD pass.
+        self._lod_i: Optional[int] = None
+        self._lod_n: Optional[int] = None
+        # Set once this LOD has reported QM road-height sampling, so later
+        # tile progress continues after that band instead of starting over.
+        self._road_z_sample = False
 
     @property
     def elapsed_s(self) -> int:
@@ -195,8 +218,9 @@ class _StreamProgress:
 
     def heartbeat(self) -> None:
         with self._lock:
-            if not self.saw_output and self.job_pct <= 0:
-                # Rotate hints while QGIS is silent on startup.
+            if not self.saw_output and self.job_pct < 8.0:
+                # Rotate hints while QGIS is silent on startup, and crawl the
+                # bar so a long cold start does not look frozen at 0%.
                 elapsed = self.elapsed_s
                 if elapsed < 5:
                     self.stage_base = "Starting QGIS process…"
@@ -206,6 +230,10 @@ class _StreamProgress:
                     self.stage_base = "Still starting QGIS (normal on first run)…"
                 else:
                     self.stage_base = "Waiting for QGIS (still loading)…"
+                # Asymptotic crawl toward ~8% until algorithm stdout arrives.
+                crawl = min(8.0, 1.5 + elapsed * 0.22)
+                if crawl > self.job_pct:
+                    self.job_pct = crawl
             self._emit_progress()
 
     def _should_log_line(self, line: str, *, force: bool = False) -> bool:
@@ -230,20 +258,33 @@ class _StreamProgress:
         self._last_log_at = time.monotonic()
         self.log(line)
 
-    def _update_pct_from_partial(self, text: str) -> None:
+    def _update_pct_from_partial(self, text: str, *, final: bool = False) -> None:
+        # Fraction counters contain digits like 70/245 — never treat those as
+        # ConsoleFeedback milestones (…70…) or the bar freezes mid-run.
+        if _FRACTION_ANY.search(text):
+            return
         if _PROGRESS_DONE.search(text):
             if self.job_pct < 100:
                 self.job_pct = 100.0
                 self.stage_base = "Finishing…"
                 self._emit_progress()
             return
-        found = [int(m.group(1)) for m in _PROGRESS_MILESTONE.finditer(text)]
+        found = []
+        for m in _PROGRESS_MILESTONE.finditer(text):
+            # A trailing "100" may be the start of 1001, not the 100% tick.
+            # Count it once a non-digit follows, or when the line is finished.
+            if not final and m.end() == len(text):
+                continue
+            found.append(int(m.group(1)))
         if not found:
             return
         pct = float(max(found))
+        # During multi-LOD fraction tracking, only accept milestones that advance
+        # the bar — coarse …10…20… ticks must not yank it back per LOD.
         if pct > self.job_pct:
             self.job_pct = pct
-            self.stage_base = f"Running… {int(pct)}%"
+            if not (self._lod_i and self._lod_n):
+                self.stage_base = f"Running… {int(pct)}%"
             self._emit_progress()
 
     def _clean_stage_line(self, text: str) -> str:
@@ -252,9 +293,54 @@ class _StreamProgress:
         text = _GLUED_PROGRESS_PREFIX.sub("", text)
         return text.strip()
 
+    def _note_lod_index(self, text: str) -> None:
+        """Remember ``LOD k (i/n)`` so fraction % maps into that LOD's band."""
+        m = _LOD_INDEX.search(text or "")
+        if not m:
+            return
+        li = int(m.group("li"))
+        n = int(m.group("n"))
+        if n <= 0 or li <= 0:
+            return
+        if self._lod_i != li or self._lod_n != n:
+            # New LOD pass — drop sticky sub-bar from the previous level.
+            self.sub_cur = None
+            self.sub_total = None
+            self.sub_unit = ""
+            self.sub_detail = ""
+            self._road_z_sample = False
+        self._lod_i = li
+        self._lod_n = n
+
+    def _phase_within_lod(self, unit: str, cur: int, total: int) -> float:
+        """
+        0–1 progress within one LOD's work (matches road_ground_clip budget).
+
+        Per LOD: select ~2%, tiles through 70%, dissolve 15%, buffer/mask 7%,
+        simplify/write ~8%. When road vertices are sampled from the mesh
+        first, that pass owns the opening 28% and tiles follow it.
+        """
+        t = max(0.0, min(1.0, cur / max(total, 1)))
+        u = (unit or "").lower()
+        sample_end = 0.28 if self._road_z_sample else 0.0
+        select_end = sample_end + 0.02
+        if u.startswith("task"):
+            return sample_end + (select_end - sample_end) * t
+        if u.startswith("tile"):
+            return select_end + (0.70 - select_end) * t
+        if u.startswith("part"):
+            return 0.70 + 0.15 * t
+        if u.startswith("step"):
+            return 0.85 + 0.07 * t
+        # Unknown unit inside an LOD — treat as linear mid-band.
+        return 0.02 + 0.90 * t
+
     def _apply_fraction_progress(self, stripped: str) -> bool:
         """Drive job % + sub-bar from '123/456 polygons' lines (not the log)."""
-        m = _FRACTION_PROGRESS.search(stripped)
+        self._note_lod_index(stripped)
+        m = _FRACTION_PROGRESS.search(stripped) or _FRACTION_PROGRESS_LABELED.search(
+            stripped
+        )
         if not m:
             return False
         total = int(m.group("total"))
@@ -262,23 +348,92 @@ class _StreamProgress:
             return False
         cur = min(int(m.group("cur")), total)
         unit = (m.group("unit") or "").lower()
-        if unit.startswith("polygon"):
-            pct = 5.0 + 85.0 * (cur / total)
+        nice_unit = unit.rstrip("s") + ("s" if not unit.endswith("s") else "")
+        if "queuing outline" in stripped.lower() and unit.startswith("point"):
+            # Outline tools queue millions of points before altitude sampling.
+            # Score that pass across the point total, not one polygon at a time.
+            nice_unit = "points"
+            stage = "Queuing outline points"
+            pct = 5.0 + 75.0 * (cur / total)
+        elif "sampling road" in stripped.lower() and unit.startswith("point"):
+            # Clip tool replaces every road vertex Z with QM height + offset
+            # before tiles run. Score that pass across the vertex total.
+            nice_unit = "points"
+            stage = "Sampling road vertices"
+            self._road_z_sample = True
+            t = cur / total
+            if self._lod_i and self._lod_n and self._lod_n > 0:
+                lo = 14.0 + 84.0 * (self._lod_i - 1) / self._lod_n
+                hi = 14.0 + 84.0 * self._lod_i / self._lod_n
+                pct = lo + (hi - lo) * (0.28 * t)
+            else:
+                pct = 14.0 + 20.0 * t
+        elif unit.startswith("road"):
+            nice_unit = "roads"
+            stage = "Collecting road triangles"
+            pct = 1.0 + 8.0 * (cur / total)
+        elif unit.startswith("chunk"):
+            nice_unit = "chunks"
+            stage = "Building road footprint"
+            pct = 9.0 + 3.0 * (cur / total)
+        elif unit.startswith("polygon"):
             nice_unit = "polygons"
             stage = "Placing points in masks"
-        elif unit.startswith("tile"):
-            pct = 10.0 + 80.0 * (cur / total)
-            nice_unit = "tiles"
-            stage = "Processing tiles"
+            pct = 5.0 + 85.0 * (cur / total)
         elif unit.startswith("point"):
-            pct = 90.0 + 9.0 * (cur / total)
             nice_unit = "points"
             stage = "Sampling / writing points"
+            pct = 90.0 + 9.0 * (cur / total)
+        elif self._lod_i and self._lod_n and self._lod_n > 0:
+            # Multi-LOD: map phase into this LOD's slice of the 14–98% band.
+            nice_unit = (
+                "tiles"
+                if unit.startswith("tile")
+                else "tasks"
+                if unit.startswith("task")
+                else "parts"
+                if unit.startswith("part")
+                else "steps"
+                if unit.startswith("step")
+                else (unit or "items")
+            )
+            phase = self._phase_within_lod(unit, cur, total)
+            prep, work = 14.0, 84.0
+            lo = prep + work * (self._lod_i - 1) / self._lod_n
+            hi = prep + work * self._lod_i / self._lod_n
+            pct = lo + (hi - lo) * phase
+            stage = f"LOD pass {self._lod_i}/{self._lod_n}"
+        elif unit.startswith("task"):
+            nice_unit = "tasks"
+            stage = "Selecting overlapping tiles"
+            pct = 12.0 + 3.0 * (cur / total)
+        elif unit.startswith("tile"):
+            nice_unit = "tiles"
+            stage = "Processing terrain tiles"
+            pct = 15.0 + 55.0 * (cur / total)
+        elif unit.startswith("part"):
+            nice_unit = "parts"
+            stage = "Dissolving tile results"
+            pct = 70.0 + 12.0 * (cur / total)
+        elif unit.startswith("step"):
+            nice_unit = "steps"
+            stage = "Buffer / mask / simplify"
+            pct = 82.0 + 14.0 * (cur / total)
         else:
-            pct = 100.0 * (cur / total)
             nice_unit = unit or "items"
             stage = self.stage_base or "Working…"
+            pct = 100.0 * (cur / total)
+
+        # Prefer a human label from the algorithm line when present.
+        label = stripped.split(":")[0].strip() if ":" in stripped else ""
+        if label and len(label) < 120 and not label[0].isdigit():
+            stage = label
         pct = min(99.0, max(0.0, pct))
+        # A later stage in the same job (edge extension, enlargement) must
+        # not pull the main bar backwards. The sub-bar still follows cur/total.
+        if pct < self.job_pct:
+            pct = self.job_pct
+        self.job_pct = pct
         self.sub_cur = cur
         self.sub_total = total
         self.sub_unit = nice_unit
@@ -292,8 +447,6 @@ class _StreamProgress:
         else:
             self.sub_detail = ""
         self.stage_base = stage
-        if nice_unit == "polygons" or pct > self.job_pct:
-            self.job_pct = pct
         self._emit_progress()
         return True
 
@@ -315,8 +468,13 @@ class _StreamProgress:
     def _handle_complete_line(self, line: str) -> None:
         self._chunks.append(line + "\n")
         self.saw_output = True
-        self._update_pct_from_partial(line)
         stripped = self._clean_stage_line(line)
+        self._note_lod_index(stripped)
+        # Prefer fraction counters before ConsoleFeedback milestones.
+        if stripped and self._apply_fraction_progress(stripped):
+            self._log_stage(stripped, is_fraction=True)
+            return
+        self._update_pct_from_partial(line, final=True)
         if not stripped:
             return
         if _IGNORE_STAGE.search(stripped) or ".py:" in stripped:
@@ -337,7 +495,6 @@ class _StreamProgress:
             and "done" not in stripped.lower()
         ):
             return
-        frac = _FRACTION_PROGRESS.search(stripped)
         if (
             len(stripped) < 320
             and not stripped.startswith("C:\\")
@@ -346,21 +503,28 @@ class _StreamProgress:
                 _STAGE_HINT.search(stripped)
                 or stripped.endswith("…")
                 or stripped.endswith("...")
-                or frac
             )
         ):
-            had_frac = self._apply_fraction_progress(stripped)
-            if not had_frac:
-                self.stage_base = stripped
-                self._emit_progress()
-            self._log_stage(stripped, is_fraction=bool(had_frac or frac))
+            self.stage_base = stripped
+            # Leave the roads/tiles sub-bar so a long silent stage does not
+            # keep showing "Roads 100%" after that phase finished.
+            if not _FRACTION_ANY.search(stripped):
+                self.sub_cur = 0
+                self.sub_total = 0
+                self.sub_unit = ""
+                self.sub_detail = ""
+            self._emit_progress()
+            self._log_stage(stripped, is_fraction=False)
             return
         if len(stripped) < 240 and not stripped.startswith("C:\\") and "=" not in stripped[:24]:
-            had_frac = self._apply_fraction_progress(stripped)
-            if not had_frac:
-                self.stage_base = stripped
-                self._emit_progress()
-            self._log_stage(stripped, is_fraction=bool(had_frac or frac))
+            self.stage_base = stripped
+            if not _FRACTION_ANY.search(stripped):
+                self.sub_cur = 0
+                self.sub_total = 0
+                self.sub_unit = ""
+                self.sub_detail = ""
+            self._emit_progress()
+            self._log_stage(stripped, is_fraction=False)
             return
         self._log_line(line, force=False)
 
@@ -389,6 +553,26 @@ class _StreamProgress:
         return "".join(self._chunks)
 
 
+def kill_process_tree(pid: int) -> None:
+    """Force-kill ``pid`` and its children (needed for .bat → qgis_process)."""
+    if pid <= 0:
+        return
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+        )
+        return
+    try:
+        os.killpg(pid, 9)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 def run_algorithm(
     algorithm: str,
     params: Dict[str, object],
@@ -401,6 +585,7 @@ def run_algorithm(
     job_count: int = 1,
     job_label: str = "",
     timeout: Optional[float] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> RunResult:
     bat_path = bat or find_qgis_process()
     cmd = build_command(bat_path, algorithm, params)
@@ -426,6 +611,17 @@ def run_algorithm(
     )
     pump.set_stage("Starting QGIS process…")
 
+    if cancel is not None and cancel.is_set():
+        pump.set_stage("Canceled")
+        return RunResult(
+            ok=False,
+            returncode=-1,
+            command=list(cmd),
+            stdout="",
+            stderr="",
+            canceled=True,
+        )
+
     stop_beat = threading.Event()
 
     def _beat() -> None:
@@ -444,28 +640,57 @@ def run_algorithm(
         cwd=str(cwd) if cwd else None,
     )
     assert proc.stdout is not None
+
+    stop_watch = threading.Event()
+
+    def _watch_cancel() -> None:
+        while not stop_watch.wait(0.25):
+            if cancel is not None and cancel.is_set():
+                if log:
+                    log(f"Stopping PID {proc.pid} (process tree)…")
+                kill_process_tree(proc.pid)
+                return
+            if proc.poll() is not None:
+                return
+
+    watch_thread = threading.Thread(target=_watch_cancel, daemon=True)
+    watch_thread.start()
+
     try:
         while True:
+            if cancel is not None and cancel.is_set() and proc.poll() is not None:
+                break
             block = proc.stdout.read(256)
             if not block:
                 break
             pump.feed(block.decode("utf-8", errors="replace"))
         pump.flush()
-        proc.wait(timeout=timeout)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_process_tree(proc.pid)
+            proc.wait(timeout=10)
+            raise
     finally:
         stop_beat.set()
+        stop_watch.set()
         beat_thread.join(timeout=2.0)
+        watch_thread.join(timeout=2.0)
 
-    ok = proc.returncode == 0
-    if ok:
+    canceled = bool(cancel is not None and cancel.is_set())
+    ok = proc.returncode == 0 and not canceled
+    if canceled:
+        pump.set_stage("Canceled")
+    elif ok:
         pump.job_pct = 100.0
         pump.set_stage("Done")
     return RunResult(
         ok=ok,
-        returncode=proc.returncode or 0,
+        returncode=proc.returncode if proc.returncode is not None else -1,
         command=list(cmd),
         stdout=pump.text(),
         stderr="",
+        canceled=canceled,
     )
 
 
@@ -475,15 +700,32 @@ def run_queue(
     bat: Optional[Path] = None,
     log: Optional[LogFn] = None,
     progress: Optional[ProgressFn] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> List[RunResult]:
     """
     jobs: iterable of {algorithm, params, label?}
+
+    ``cancel``: when set, kill the current process tree and skip remaining jobs.
     """
     job_list = list(jobs)
     results: List[RunResult] = []
     bat_path = bat or find_qgis_process()
     n = len(job_list)
     for i, job in enumerate(job_list, start=1):
+        if cancel is not None and cancel.is_set():
+            if log:
+                log(f"Queue stopped before job {i}/{n}.")
+            results.append(
+                RunResult(
+                    ok=False,
+                    returncode=-1,
+                    command=[],
+                    stdout="",
+                    stderr="",
+                    canceled=True,
+                )
+            )
+            break
         label = str(job.get("label") or job.get("algorithm") or f"job {i}")
         if log:
             log(f"\n=== [{i}/{n}] {label} ===")
@@ -493,9 +735,9 @@ def run_queue(
                     "job_index": i,
                     "job_count": n,
                     "job_label": label,
-                    "job_pct": 0.0,
-                    "overall_pct": ((i - 1) / max(n, 1)) * 100.0,
-                    "stage": "Starting…",
+                    "job_pct": 3.0,
+                    "overall_pct": ((i - 1) / max(n, 1)) * 100.0 + 3.0 / max(n, 1),
+                    "stage": "Starting QGIS process…",
                 }
             )
         result = run_algorithm(
@@ -507,9 +749,13 @@ def run_queue(
             job_index=i,
             job_count=n,
             job_label=label,
+            cancel=cancel,
         )
         results.append(result)
         if log:
+            if result.canceled:
+                log(f"STOPPED (exit {result.returncode})")
+                break
             if result.ok:
                 log(f"OK (exit {result.returncode})")
             else:

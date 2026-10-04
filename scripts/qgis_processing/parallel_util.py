@@ -156,6 +156,9 @@ def map_in_processes(
     scripts_root: Optional[str] = None,
     feedback=None,
     progress_label: str = "Parallel work",
+    progress_unit: str = "tiles",
+    progress_start: Optional[float] = None,
+    progress_end: Optional[float] = None,
 ) -> List[Any]:
     """
     Map ``fn`` over ``tasks`` in a process pool.
@@ -165,11 +168,37 @@ def map_in_processes(
 
     Workers never receive QGIS layers — only picklable Python data the parent
     already extracted (paths, coordinates, snapshots).
+
+    Progress text uses ``"{done}/{n} {progress_unit}"`` so the web UI can
+    drive a linear sub-bar. Optional ``progress_start``/``progress_end`` also
+    call ``feedback.setProgress``.
     """
     if not tasks:
         return []
 
     workers = max(1, int(workers))
+    unit = (progress_unit or "items").strip() or "items"
+
+    def _report(done: int, n: int) -> None:
+        if feedback is None:
+            return
+        if hasattr(feedback, "setProgressText"):
+            # Keep label for humans; put fraction+unit last for the UI parser.
+            label = (progress_label or "").strip()
+            if label:
+                feedback.setProgressText(f"{label}: {done}/{n} {unit}")
+            else:
+                feedback.setProgressText(f"{done}/{n} {unit}")
+        if (
+            progress_start is not None
+            and progress_end is not None
+            and hasattr(feedback, "setProgress")
+            and n > 0
+        ):
+            lo = float(progress_start)
+            hi = float(progress_end)
+            feedback.setProgress(int(lo + (hi - lo) * (done / n)))
+
     if workers == 1 or len(tasks) == 1:
         out: List[Any] = []
         n = len(tasks)
@@ -178,13 +207,7 @@ def map_in_processes(
                 if feedback.isCanceled():
                     break
             out.append(fn(task))
-            if feedback is not None and (
-                i % 25 == 0 or i + 1 == n
-            ):
-                if hasattr(feedback, "setProgressText"):
-                    feedback.setProgressText(
-                        f"{progress_label}: {i + 1}/{n}"
-                    )
+            _report(i + 1, n)
         return out
 
     ctx, worker_py = spawn_context_for_workers(feedback=feedback)
@@ -196,6 +219,9 @@ def map_in_processes(
             scripts_root=scripts_root,
             feedback=feedback,
             progress_label=progress_label,
+            progress_unit=progress_unit,
+            progress_start=progress_start,
+            progress_end=progress_end,
         )
 
     results: List[Optional[Any]] = [None] * len(tasks)
@@ -229,11 +255,5 @@ def map_in_processes(
             idx = future_map[fut]
             results[idx] = fut.result()
             done += 1
-            if feedback is not None and (
-                done % 10 == 0 or done == n
-            ):
-                if hasattr(feedback, "setProgressText"):
-                    feedback.setProgressText(
-                        f"{progress_label}: {done}/{n}"
-                    )
+            _report(done, n)
     return list(results)

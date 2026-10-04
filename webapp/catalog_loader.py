@@ -391,9 +391,23 @@ def list_mesh_choices(
     children = list_subfolders(tier_dir)
 
     if pick == "tileset":
-        tilesets = [c for c in children if _is_mesh_tileset(c)]
+        # Preferred: {tier}/{tileset}/{lod}/… — also allow LODs directly under
+        # the tier ({tier}/0..N) which is common for a single source tileset.
+        found: List[Path] = []
+        if _is_mesh_tileset(tier_dir):
+            found.append(tier_dir)
+        found.extend(c for c in children if _is_mesh_tileset(c))
+        # De-dupe while preserving order.
+        seen = set()
+        tilesets: List[Path] = []
+        for path in found:
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            tilesets.append(path)
         for child in tilesets:
-            if tier == "source" and len(tilesets) == 1:
+            if child == tier_dir or (tier == "source" and len(tilesets) == 1):
                 rest = ""
             elif tier == "source":
                 rest = child.name
@@ -573,13 +587,28 @@ _SHP_EXISTENCE_EXTS = (
 
 
 def output_destination_taken(path: Union[str, Path], *, is_folder: bool = False) -> bool:
-    """True if saving here would collide with an existing file/folder (no overwrite)."""
+    """
+    True if saving here would collide with an existing file/folder (no overwrite).
+
+    Only the destination folder (the chosen Save-to tier) is checked — never
+    sibling tiers under the same domain. For shapefiles, also treat
+    ``name_lodN.shp`` in that same folder as a collision with base ``name``.
+    """
     p = Path(path)
+    folder = p.parent
     if is_folder:
         return p.exists()
     if p.suffix.lower() == ".shp":
-        stem = p.with_suffix("")
-        return any(stem.with_suffix(ext).exists() for ext in _SHP_EXISTENCE_EXTS)
+        stem = p.stem
+        if any((folder / f"{stem}{ext}").exists() for ext in _SHP_EXISTENCE_EXTS):
+            return True
+        # Multi-LOD runs write name_lodN.shp next to the base path.
+        try:
+            if any(folder.glob(f"{stem}_lod*.shp")):
+                return True
+        except OSError:
+            pass
+        return False
     return p.exists()
 
 
@@ -588,10 +617,10 @@ def default_output_spec(
     *,
     tier: Optional[str] = None,
 ) -> Dict[str, str]:
-    chosen = tier if tier in ("staging", "final") else None
+    chosen = tier if tier in OUTPUT_TIERS else None
     if chosen is None:
         raw = str(param.get("default_tier") or "final")
-        chosen = raw if raw in ("staging", "final") else "final"
+        chosen = raw if raw in OUTPUT_TIERS else "final"
     return {
         "tier": chosen,
         "name": output_name_stem(str(param.get("default_name") or "output")),

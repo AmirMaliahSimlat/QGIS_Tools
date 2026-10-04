@@ -189,6 +189,50 @@ body::before {
   backdrop-filter: blur(10px);
 }
 
+/* Params gated by a parent switch (e.g. Simplify → buffer / merge / exact). */
+.qt-param-group {
+  margin: 0 0 0.55rem 0.85rem;
+  padding: 0;
+}
+
+.qt-param-subrow {
+  position: relative !important;
+  display: flex !important;
+  margin: 0 !important;
+  padding: 0.15rem 0 0.15rem 1.65rem !important;
+  gap: 0 !important;
+}
+
+/* Continuous vertical stem */
+.qt-param-subrow::before {
+  content: "";
+  position: absolute;
+  left: 0.5rem;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid rgba(148, 163, 184, 0.9);
+  z-index: 1;
+}
+
+/* Horizontal elbow into the field */
+.qt-param-subrow::after {
+  content: "";
+  position: absolute;
+  left: 0.5rem;
+  top: 1.1rem;
+  width: 0.85rem;
+  height: 0;
+  border-top: 2px solid rgba(148, 163, 184, 0.9);
+  z-index: 1;
+}
+
+/* Last child: stem stops at the elbow */
+.qt-param-subrow.is-last::before {
+  bottom: auto;
+  height: 1.1rem;
+}
+
 .qt-tool-card {
   background: var(--bg-card) !important;
   border: 1px solid var(--line) !important;
@@ -1058,6 +1102,25 @@ body::before {
   background: var(--bg-2) !important;
   color: var(--text) !important;
   border: 1px solid var(--line);
+  /* Quasar fades menus for 0.3s and they keep capturing clicks. Close instantly. */
+  --q-transition-duration: 0s !important;
+  transition: none !important;
+  animation: none !important;
+}
+
+.q-menu.q-transition--fade-leave-active,
+.q-menu.q-transition--fade-leave-to,
+.q-menu.q-transition--scale-leave-active,
+.q-menu.q-transition--scale-leave-to,
+.q-select__dialog.q-transition--fade-leave-active,
+.q-select__dialog.q-transition--fade-leave-to {
+  --q-transition-duration: 0s !important;
+  pointer-events: none !important;
+  opacity: 0 !important;
+  transition: none !important;
+  transition-duration: 0s !important;
+  animation: none !important;
+  animation-duration: 0s !important;
 }
 
 .q-item {
@@ -1092,4 +1155,10 @@ body::before {
   image-rendering: auto;
   flex-shrink: 0;
   filter: drop-shadow(0 0 6px rgba(251, 146, 60, 0.35));
+}
+
+/* File/library selects: keep "(none)" as a valid value, hide it in the open list
+   when real files exist (popup-content-class is only applied then). */
+.qt-file-select-popup .q-item:first-child {
+  display: none !important;
 }

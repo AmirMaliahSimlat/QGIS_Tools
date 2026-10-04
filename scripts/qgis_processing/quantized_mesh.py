@@ -42,6 +42,33 @@ def decode_high_water_mark(indices: List[int]) -> List[int]:
     return decoded
 
 
+def encode_high_water_mark(indices: List[int]) -> List[int]:
+    """Inverse of ``decode_high_water_mark`` (vertices must appear in order 0..n)."""
+    highest = 0
+    encoded = []
+    for index in indices:
+        code = highest - int(index)
+        encoded.append(code)
+        if code == 0:
+            highest += 1
+    return encoded
+
+
+def geodetic_to_ecef(lon_deg: float, lat_deg: float, height_m: float) -> Tuple[float, float, float]:
+    a = 6378137.0
+    f = 1.0 / 298.257223563
+    e2 = f * (2.0 - f)
+    lon = math.radians(lon_deg)
+    lat = math.radians(lat_deg)
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    x = (n + height_m) * cos_lat * math.cos(lon)
+    y = (n + height_m) * cos_lat * math.sin(lon)
+    z = (n * (1.0 - e2) + height_m) * sin_lat
+    return x, y, z
+
+
 def geographic_tile_count(level: int) -> Tuple[int, int]:
     return 2 ** (level + 1), 2 ** level
 
@@ -425,6 +452,134 @@ def write_terrain_file(path: Path, data: bytes, use_gzip: bool) -> None:
         path.write_bytes(gzip.compress(data, compresslevel=1))
     else:
         path.write_bytes(data)
+
+
+def encode_quantized_mesh_tile(
+    lons: List[float],
+    lats: List[float],
+    altitudes: List[float],
+    triangles: List[Tuple[int, int, int]],
+    level: int,
+    x: int,
+    y: int,
+) -> bytes:
+    """
+    Build an uncompressed quantized-mesh buffer from lon/lat/height + triangles.
+
+    Vertices are remapped into high-water-mark order. West/south/east/north
+    edge vertex lists are rebuilt from verts that sit on the tile boundary.
+    """
+    if not lons or not triangles:
+        raise ValueError("Empty mesh")
+    if not (len(lons) == len(lats) == len(altitudes)):
+        raise ValueError("Vertex array length mismatch")
+
+    # Remap vertices to first-appearance order (required by HWM encoding).
+    order: List[int] = []
+    remap: Dict[int, int] = {}
+    flat_indices: List[int] = []
+    for i0, i1, i2 in triangles:
+        for old in (i0, i1, i2):
+            if old not in remap:
+                remap[old] = len(order)
+                order.append(old)
+            flat_indices.append(remap[old])
+
+    n = len(order)
+    olons = [float(lons[i]) for i in order]
+    olats = [float(lats[i]) for i in order]
+    oalts = [float(altitudes[i]) for i in order]
+
+    west, south, east, north = tile_rectangle(level, x, y)
+    du = max(east - west, 1e-15)
+    dv = max(north - south, 1e-15)
+    min_alt = min(oalts)
+    max_alt = max(oalts)
+    if max_alt <= min_alt:
+        max_alt = min_alt + 1.0
+
+    u_abs = [
+        max(0, min(int(QUANTIZATION), int(round((lo - west) / du * QUANTIZATION))))
+        for lo in olons
+    ]
+    v_abs = [
+        max(0, min(int(QUANTIZATION), int(round((la - south) / dv * QUANTIZATION))))
+        for la in olats
+    ]
+    h_abs = [_quantize_height(a, min_alt, max_alt) for a in oalts]
+
+    # Bounding sphere / center in ECEF.
+    ecefs = [geodetic_to_ecef(lo, la, al) for lo, la, al in zip(olons, olats, oalts)]
+    cx = sum(p[0] for p in ecefs) / n
+    cy = sum(p[1] for p in ecefs) / n
+    cz = sum(p[2] for p in ecefs) / n
+    radius = 0.0
+    for px, py, pz in ecefs:
+        radius = max(radius, math.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2))
+    radius = max(radius, 1.0)
+    # Horizon occlusion: ellipsoid-scaled estimate toward tile center.
+    scale = 1.0 + (radius / 6378137.0) * 0.1
+    hx, hy, hz = cx * scale, cy * scale, cz * scale
+
+    header = struct.pack(
+        "<dddffddddddd",
+        cx,
+        cy,
+        cz,
+        float(min_alt),
+        float(max_alt),
+        cx,
+        cy,
+        cz,
+        float(radius),
+        hx,
+        hy,
+        hz,
+    )
+    if len(header) != HEADER_BYTES:
+        raise RuntimeError(f"Header size {len(header)} != {HEADER_BYTES}")
+
+    body = bytearray()
+    body += struct.pack("<I", n)
+    body += struct.pack("<" + "H" * n, *_encode_delta_u16(u_abs))
+    body += struct.pack("<" + "H" * n, *_encode_delta_u16(v_abs))
+    body += struct.pack("<" + "H" * n, *_encode_delta_u16(h_abs))
+
+    use32 = n > 65536
+    align = 4 if use32 else 2
+    pad = (align - (len(body) % align)) % align
+    body += b"\x00" * pad
+
+    tri_count = len(flat_indices) // 3
+    body += struct.pack("<I", tri_count)
+    enc_idx = encode_high_water_mark(flat_indices)
+    fmt = "I" if use32 else "H"
+    body += struct.pack("<" + fmt * len(enc_idx), *enc_idx)
+
+    # Edge vertex lists (indices into remapped vertex array).
+    eps_u = 2
+    eps_v = 2
+
+    def edge_indices(pred, sort_key):
+        ids = [i for i in range(n) if pred(i)]
+        ids.sort(key=sort_key)
+        return ids
+
+    west_ids = edge_indices(lambda i: u_abs[i] <= eps_u, lambda i: v_abs[i])
+    south_ids = edge_indices(lambda i: v_abs[i] <= eps_v, lambda i: u_abs[i])
+    east_ids = edge_indices(
+        lambda i: u_abs[i] >= int(QUANTIZATION) - eps_u, lambda i: v_abs[i]
+    )
+    north_ids = edge_indices(
+        lambda i: v_abs[i] >= int(QUANTIZATION) - eps_v, lambda i: u_abs[i]
+    )
+
+    for ids in (west_ids, south_ids, east_ids, north_ids):
+        body += struct.pack("<I", len(ids))
+        if ids:
+            body += struct.pack("<" + fmt * len(ids), *ids)
+
+    return bytes(header) + bytes(body)
 
 
 def sample_lonlats_batch(

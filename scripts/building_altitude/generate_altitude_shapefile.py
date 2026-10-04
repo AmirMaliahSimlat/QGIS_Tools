@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Generate buildings GeoPackage with altitude, max_altitude, and height.
+Generate buildings GeoPackage with altitude and height.
 
-  altitude / max_altitude — min/max quantized-mesh samples on exterior-ring
-                            vertices and edge midpoints
-  height = Uniform(min, max) + (max_altitude - altitude)
+  altitude — min quantized-mesh sample on exterior-ring vertices / midpoints
+  height   = Uniform(min, max) + (max_mesh - altitude)
+             (max_mesh is computed, not stored)
 
 Run via OSGeo4W / QGIS Python (needs GDAL/OGR):
 
@@ -38,7 +38,6 @@ OUT_DIR = os.path.join(ROOT, "Building Altitude Outputs")
 OUT_GPKG = os.path.join(OUT_DIR, "B_BUILDINGS_A_with_altitude_precise.gpkg")
 
 ALTITUDE_FIELD = "altitude"
-MAX_ALTITUDE_FIELD = "max_altitude"
 HEIGHT_FIELD = "height"
 
 OGR2OGR = r"C:\Program Files\QGIS 3.44.12\bin\ogr2ogr.exe"
@@ -102,8 +101,8 @@ def _ensure_real_field(layer, name: str) -> int:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=(
-            "Add altitude, max_altitude, and height = "
-            "Uniform(min, max) + (max_altitude - altitude)."
+            "Add altitude and height = "
+            "Uniform(min, max) + (max_mesh - altitude)."
         )
     )
     p.add_argument("--min", dest="min_v", type=float, required=True)
@@ -140,15 +139,14 @@ def main(argv=None):
     total = layer.GetFeatureCount()
 
     alt_idx = _ensure_real_field(layer, ALTITUDE_FIELD)
-    max_idx = _ensure_real_field(layer, MAX_ALTITUDE_FIELD)
     height_idx = _ensure_real_field(layer, HEIGHT_FIELD)
     print(
-        f"Filling '{ALTITUDE_FIELD}', '{MAX_ALTITUDE_FIELD}', "
+        f"Filling '{ALTITUDE_FIELD}', "
         f"'{HEIGHT_FIELD}' for {total} features…"
     )
     print(
         f"  height = U({args.min_v}, {args.max_v}) + "
-        f"({MAX_ALTITUDE_FIELD} - {ALTITUDE_FIELD})"
+        f"(max_mesh - {ALTITUDE_FIELD})"
     )
     t0 = time.time()
     written = 0
@@ -169,12 +167,10 @@ def main(argv=None):
         ):
             height = random.uniform(args.min_v, args.max_v) + (max_z - min_z)
             feat.SetField(alt_idx, float(min_z))
-            feat.SetField(max_idx, float(max_z))
             feat.SetField(height_idx, float(height))
             filled += 1
         else:
             feat.SetFieldNull(alt_idx)
-            feat.SetFieldNull(max_idx)
             feat.SetFieldNull(height_idx)
         layer.SetFeature(feat)
         written += 1

@@ -60,6 +60,8 @@ from flow_graph import (
 from qgis_runner import QgisProcessConfig, find_qgis_process, run_queue
 import app_settings
 import user_defaults
+from field_warnings import matching_fields, vector_field_names
+from zone_editor.api import register_zone_api
 
 CATALOG = load_catalog()
 ensure_database_layout(DEFAULT_DATABASE, CATALOG)
@@ -118,6 +120,7 @@ state: Dict[str, Any] = {
     "log_lines": [],
     "maple_mode": False,
     "pipeline_tree_open": False,
+    "run_cancel": None,  # threading.Event while a queue is active
     "run_progress": {
         "overall_pct": 0.0,
         "job_pct": 0.0,
@@ -128,12 +131,15 @@ state: Dict[str, Any] = {
         "running": False,
         "done": False,
         "ok": None,
+        "canceled": False,
         "sub_cur": None,
         "sub_total": None,
         "sub_unit": "",
         "sub_detail": "",
     },
 }
+
+register_zone_api(app, get_state=lambda: state)
 
 # Input params whose values are paths under Database/<map>/…
 # (Outputs keep tier/name; only the map folder prefix changes.)
@@ -192,7 +198,7 @@ def render_map_picker() -> None:
                     value=current,
                     label=None,
                 )
-                .props(_field_props() + " clearable")
+                .props(_select_props("clearable"))
                 .classes("flex-grow")
             )
 
@@ -525,8 +531,9 @@ def _init_defaults_for(
                 # Legacy tier rename
                 if cur.get("tier") == "working":
                     cur["tier"] = "staging"
-                # Keep explicit tests; otherwise follow the pipeline tree.
-                if cur.get("tier") != "tests":
+                # Respect an explicit Save-to choice (tests/staging/final).
+                # Only fill tier from the pipeline tree when unset/invalid.
+                if cur.get("tier") not in OUTPUT_TIERS:
                     cur["tier"] = pipe_tier
                 state["values"][tid][p["id"]] = cur
         return
@@ -869,8 +876,8 @@ def _build_jobs() -> List[Dict[str, Any]]:
                     path, is_folder=p.get("type") == "folder_output"
                 ):
                     raise ValueError(
-                        f"{tool['display_name']}: output already exists — "
-                        f"choose a different name or tier ({path})"
+                        f"{tool['display_name']}: output already exists in this "
+                        f"folder — choose a different name ({path})"
                     )
                 params[pid] = path
                 continue
@@ -896,8 +903,196 @@ def _build_jobs() -> List[Dict[str, Any]]:
     return jobs
 
 
+def _resolve_raw_param(
+    tid: str,
+    param_id: str,
+    *,
+    wires: Dict[str, Dict[str, tuple]],
+    produced: Dict[str, Dict[str, object]],
+) -> Any:
+    """Resolve one param value with pipeline wires (same rules as _build_jobs)."""
+    tool_wires = wires.get(tid) or {}
+    if param_id in tool_wires:
+        src_tool, src_param = tool_wires[param_id]
+        if src_tool in produced and src_param in produced[src_tool]:
+            return produced[src_tool][src_param]
+        src_raw = (state["values"].get(src_tool) or {}).get(src_param)
+        src_tool_def = tool_by_id(CATALOG, src_tool)
+        src_param_def = None
+        if src_tool_def:
+            src_param_def = next(
+                (
+                    p
+                    for p in src_tool_def.get("params", [])
+                    if p["id"] == src_param
+                ),
+                None,
+            )
+        if src_param_def is not None:
+            return _resolve_param_value(src_tool_def, src_param_def, src_raw)
+        return src_raw
+    return (state["values"].get(tid) or {}).get(param_id)
+
+
+def _scannable_vector_path(
+    tid: str,
+    param_id: str,
+    path: Any,
+    *,
+    wires: Dict[str, Dict[str, tuple]],
+    produced: Dict[str, Dict[str, object]],
+    depth: int = 0,
+) -> Optional[Path]:
+    """
+    Find an on-disk vector to scan for field names.
+
+    If the immediate input is a future pipeline output, walk upstream to the
+    source layer that will be copied into that output.
+    """
+    if depth > 12:
+        return None
+    if path and path not in ("", "(none)"):
+        p = Path(str(path))
+        if p.is_file():
+            return p
+    wire = (wires.get(tid) or {}).get(param_id)
+    if not wire:
+        return None
+    src_tid, _src_param = wire
+    src_tool = tool_by_id(CATALOG, src_tid)
+    if not src_tool:
+        return None
+    specs = list(src_tool.get("writes_fields") or [])
+    candidates: List[str] = [s.get("input") for s in specs if s.get("input")]
+    if not candidates:
+        candidates = [
+            p["id"]
+            for p in src_tool.get("params", [])
+            if p.get("type") == "vector_file"
+        ]
+    for cand in candidates:
+        up_path = _resolve_raw_param(
+            src_tid, cand, wires=wires, produced=produced
+        )
+        found = _scannable_vector_path(
+            src_tid,
+            cand,
+            up_path,
+            wires=wires,
+            produced=produced,
+            depth=depth + 1,
+        )
+        if found is not None:
+            return found
+    return None
+
+
+def _field_replace_warnings() -> List[Dict[str, Any]]:
+    """
+    Fields that already exist on an input and will be recalculated in a new
+    output file (source inputs are never modified).
+    """
+    wires = _pipeline_wires()
+    produced: Dict[str, Dict[str, object]] = {}
+    warnings: List[Dict[str, Any]] = []
+
+    for tool in _selected_tools():
+        tid = tool["id"]
+        _init_defaults_for(tool)
+        for spec in tool.get("writes_fields") or []:
+            input_id = spec.get("input")
+            fields = list(spec.get("fields") or [])
+            if not input_id or not fields:
+                continue
+            raw_path = _resolve_raw_param(
+                tid, input_id, wires=wires, produced=produced
+            )
+            scan = _scannable_vector_path(
+                tid,
+                input_id,
+                raw_path,
+                wires=wires,
+                produced=produced,
+            )
+            if scan is None:
+                continue
+            try:
+                existing = vector_field_names(scan)
+            except Exception:
+                continue
+            hits = matching_fields(existing, fields)
+            if not hits:
+                continue
+            warnings.append(
+                {
+                    "tool_id": tid,
+                    "tool_name": tool.get("display_name") or tid,
+                    "input_path": str(scan),
+                    "fields": hits,
+                }
+            )
+
+        produced[tid] = {}
+        raw = dict(state["values"].get(tid) or {})
+        for param_id, (src_tool, src_param) in (wires.get(tid) or {}).items():
+            if src_tool in produced and src_param in produced[src_tool]:
+                raw[param_id] = produced[src_tool][src_param]
+            else:
+                raw[param_id] = _resolve_raw_param(
+                    tid, param_id, wires=wires, produced=produced
+                )
+        for p in tool.get("params", []):
+            if p.get("type") not in (
+                "vector_output",
+                "folder_output",
+                "raster_output",
+            ):
+                continue
+            try:
+                out_path = resolve_output_path(_db(), CATALOG, p, raw.get(p["id"]))
+            except Exception:
+                continue
+            produced[tid][p["id"]] = out_path
+
+    return warnings
+
+
+def _enter_run_page() -> None:
+    state["page"] = "run"
+    state["log_lines"] = []
+    state["run_cancel"] = threading.Event()
+    state["run_progress"] = {
+        "overall_pct": 0.0,
+        "job_pct": 0.0,
+        "job_index": 0,
+        "job_count": 0,
+        "job_label": "Starting…",
+        "stage": "Opening run console…",
+        "running": True,
+        "done": False,
+        "ok": None,
+        "canceled": False,
+        "sub_cur": None,
+        "sub_total": None,
+        "sub_unit": "",
+        "sub_detail": "",
+        "_started": True,
+    }
+    # Start the queue worker immediately — don't wait for the run-page mount
+    # timer, which left the UI on "Opening run console… / 0%" for too long.
+    _start_run()
+    render_body.refresh()
+
+
 def _field_props() -> str:
     return "outlined dense dark color=teal-4"
+
+
+def _select_props(extra: str = "") -> str:
+    """Selects close instantly so the menu fade cannot block the next click."""
+    base = _field_props() + " transition-duration=0"
+    extra = (extra or "").strip()
+    return f"{base} {extra}" if extra else base
 
 
 def _dual_icon_tab(tab: Dict[str, Any]):
@@ -1198,14 +1393,117 @@ def render_select_page() -> None:
             queue_panel()
 
 
-def _param_enabled(tool_id: str, param: Dict[str, Any], raw: Optional[Dict[str, Any]] = None) -> bool:
-    """False when a catalog ``enabled_by`` switch is off."""
-    gate = param.get("enabled_by")
-    if not gate:
+def _resolve_mesh_pick(tool_id: str, param: Dict[str, Any]) -> str:
+    """
+    Resolve mesh_pick for a folder param.
+
+    ``auto``: full tileset when LOD min/max are used (any requested level must
+    exist under the tileset — a highest-LOD-only folder only contains that one
+    level, e.g. 14, so asking for 13 fails). Legacy LOD_LAYERS > 1 also uses
+    tileset; otherwise highest LOD only.
+    """
+    pick = str(param.get("mesh_pick") or "lod").strip().lower()
+    if pick != "auto":
+        return pick or "lod"
+    raw = state["values"].get(tool_id) or {}
+    # LOD_MIN / LOD_MAX always need the tileset root so any level in range exists.
+    if "LOD_MIN" in raw or "LOD_MAX" in raw:
+        return "tileset"
+    try:
+        lod_layers = int(raw.get("LOD_LAYERS") or 1)
+    except (TypeError, ValueError):
+        lod_layers = 1
+    return "tileset" if lod_layers > 1 else "lod"
+
+
+def _catalog_param(tool_id: str, param_id: str) -> Optional[Dict[str, Any]]:
+    tool = tool_by_id(CATALOG, tool_id)
+    if not tool:
+        return None
+    for param in tool.get("params") or []:
+        if param.get("id") == param_id:
+            return param
+    return None
+
+
+def _stored_param_value(raw: Dict[str, Any], param: Optional[Dict[str, Any]], key: str):
+    if key in raw and raw.get(key) is not None:
+        return raw.get(key)
+    if param is not None and "default" in param:
+        return param.get("default")
+    return None
+
+
+def _values_match(actual, expected) -> bool:
+    if actual == expected:
         return True
+    if isinstance(expected, bool):
+        return bool(actual) is expected
+    if isinstance(expected, int) and not isinstance(expected, bool):
+        try:
+            return int(actual) == int(expected)
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _param_enabled(
+    tool_id: str,
+    param: Dict[str, Any],
+    raw: Optional[Dict[str, Any]] = None,
+    _seen: Optional[set] = None,
+) -> bool:
+    """False when a gating switch or enum is not in the state this field needs.
+
+    ``enabled_by`` shows the field only while that switch is on.
+    ``enabled_by_off`` shows it only while that switch is off.
+    ``enabled_when`` maps a parameter id to the value it must have.
+    A gate that is itself hidden counts as not satisfied.
+    """
+    if _seen is None:
+        _seen = set()
+    pid = param.get("id")
+    if pid in _seen:
+        return True
+    _seen.add(pid)
     if raw is None:
         raw = state["values"].get(tool_id) or {}
-    return bool(raw.get(gate))
+
+    def _gate_open(key: str, want_on: bool) -> bool:
+        parent = _catalog_param(tool_id, key)
+        if parent is not None and not _param_enabled(tool_id, parent, raw, _seen):
+            return False
+        return bool(_stored_param_value(raw, parent, key)) is want_on
+
+    gate = param.get("enabled_by")
+    if isinstance(gate, str) and gate and not _gate_open(gate, True):
+        return False
+    gate_off = param.get("enabled_by_off")
+    if isinstance(gate_off, str) and gate_off and not _gate_open(gate_off, False):
+        return False
+    when = param.get("enabled_when") or {}
+    if isinstance(when, dict):
+        for key, expected in when.items():
+            parent = _catalog_param(tool_id, key)
+            if parent is not None and not _param_enabled(tool_id, parent, raw, _seen):
+                return False
+            actual = _stored_param_value(raw, parent, key)
+            if not _values_match(actual, expected):
+                return False
+    return True
+
+
+def _param_gates_others(tool_id: str, key: str) -> bool:
+    tool = tool_by_id(CATALOG, tool_id)
+    if not tool:
+        return False
+    for param in tool.get("params") or []:
+        if param.get("enabled_by") == key or param.get("enabled_by_off") == key:
+            return True
+        when = param.get("enabled_when") or {}
+        if isinstance(when, dict) and key in when:
+            return True
+    return False
 
 
 def _param_widget(
@@ -1216,6 +1514,15 @@ def _param_widget(
 ) -> None:
     if not _param_enabled(tool_id, param):
         return
+    _param_widget_body(tool_id, param, wired_from=wired_from)
+
+
+def _param_widget_body(
+    tool_id: str,
+    param: Dict[str, Any],
+    *,
+    wired_from: Optional[tuple] = None,
+) -> None:
     vals = state["values"][tool_id]
     pid = param["id"]
     ptype = param["type"]
@@ -1244,18 +1551,22 @@ def _param_widget(
 
     if ptype in ("vector_file", "folder", "raster_file"):
         lib = param.get("library")
+        mesh_pick = (
+            _resolve_mesh_pick(tool_id, param)
+            if lib == "quantized_mesh"
+            else param.get("mesh_pick")
+        )
         choices = (
             library_choices(
                 _db(),
                 CATALOG,
                 lib,
                 ptype,
-                mesh_pick=param.get("mesh_pick"),
+                mesh_pick=mesh_pick,
             )
             if lib
             else []
         )
-        options = ["(none)"] + [c["label"] for c in choices]
         path_by_label = {c["label"]: c["path"] for c in choices}
         current_path = vals.get(pid)
         current_label = "(none)"
@@ -1263,21 +1574,33 @@ def _param_widget(
             if path == current_path:
                 current_label = lab
                 break
+        # NiceGUI requires the current value to be in options. Keep "(none)" in
+        # options for that, but hide it in the open popup when real files exist.
+        options = ["(none)"] + [c["label"] for c in choices]
+        select_value = current_label if current_label in options else "(none)"
+        select_props = _select_props("clearable")
+        if choices:
+            select_props += ' popup-content-class="qt-file-select-popup"'
 
         with ui.row().classes("w-full items-center no-wrap gap-2"):
             sel = (
                 ui.select(
                     options=options,
-                    value=current_label if current_label in options else "(none)",
+                    value=select_value,
                     label=label + star,
                 )
-                .props(_field_props())
+                .props(select_props)
                 .classes("flex-grow")
             )
 
-            def on_sel(e, tool=tool_id, key=pid, mapping=path_by_label) -> None:
+            def on_sel(e, tool=tool_id, key=pid, mapping=path_by_label, widget=sel) -> None:
                 lab = e.value
-                state["values"][tool][key] = None if lab in (None, "(none)") else mapping.get(lab)
+                if lab in (None, "", "(none)"):
+                    state["values"][tool][key] = None
+                    if widget.value != "(none)":
+                        widget.set_value("(none)")
+                else:
+                    state["values"][tool][key] = mapping.get(lab)
 
             sel.on_value_change(on_sel)
             _import_button(tool_id, param)
@@ -1323,7 +1646,7 @@ def _param_widget(
                         value=tier if tier in OUTPUT_TIERS else "staging",
                         label="Save to",
                     )
-                    .props(_field_props())
+                    .props(_select_props())
                     .classes("w-40")
                 )
                 name_inp = (
@@ -1343,7 +1666,7 @@ def _param_widget(
                         path, is_folder=ptype == "folder_output"
                     )
                     conflict_lbl.set_text(
-                        "Name already exists — pick another name or tier"
+                        "Name already exists in this folder"
                         if conflict
                         else ""
                     )
@@ -1354,7 +1677,8 @@ def _param_widget(
                     if not isinstance(cur, dict):
                         cur = default_output_spec(param)
                     cur = dict(cur)
-                    cur["tier"] = e.value
+                    chosen = e.value if e.value in OUTPUT_TIERS else cur.get("tier")
+                    cur["tier"] = chosen if chosen in OUTPUT_TIERS else "staging"
                     state["values"][tool][key] = cur
                     _refresh_path(cur)
 
@@ -1371,7 +1695,7 @@ def _param_widget(
                 name_inp.on_value_change(on_name)
             path_lbl = ui.label(resolved).classes("qt-meta")
             conflict_lbl = ui.label(
-                "Name already exists — pick another name or tier" if taken else ""
+                "Name already exists in this folder" if taken else ""
             ).classes("text-negative text-caption")
             conflict_lbl.set_visibility(taken)
         return
@@ -1389,10 +1713,7 @@ def _param_widget(
 
             def on_bool(e, tool=tool_id, key=pid) -> None:
                 state["values"][tool][key] = bool(e.value)
-                tool_def = tool_by_id(CATALOG, tool)
-                if tool_def and any(
-                    p.get("enabled_by") == key for p in tool_def.get("params") or []
-                ):
+                if _param_gates_others(tool, key):
                     render_body.refresh()
 
             sw.on_value_change(on_bool)
@@ -1414,7 +1735,7 @@ def _param_widget(
                     value=opts[idx] if opts else None,
                     label=label + star,
                 )
-                .props(_field_props())
+                .props(_select_props())
                 .classes("flex-grow")
             )
 
@@ -1423,6 +1744,8 @@ def _param_widget(
                     state["values"][tool][key] = options.index(e.value)
                 except ValueError:
                     state["values"][tool][key] = 0
+                if _param_gates_others(tool, key):
+                    render_body.refresh()
 
             sel.on_value_change(on_enum)
             _set_as_default_button(tool_id, param)
@@ -1461,6 +1784,32 @@ def _param_widget(
                     state["values"][tool][key] = None
                     return
                 state["values"][tool][key] = int(v) if as_int else float(v)
+                # LOD min/max used to flip mesh library (tileset vs highest LOD)
+                # and call render_body.refresh() — that remounted the form on
+                # every keystroke so typing "13" died after "1". Mesh pick for
+                # this tool is always tileset now; only refresh if we actually
+                # clear a mismatched INPUT_MESH.
+                if key in ("LOD_MIN", "LOD_MAX", "LOD_LAYERS"):
+                    mesh_val = state["values"][tool].get("INPUT_MESH")
+                    if not mesh_val:
+                        return
+                    from pathlib import Path as _P
+
+                    p = _P(str(mesh_val))
+                    is_lod_folder = p.is_dir() and p.name.isdigit()
+                    want_tileset = _resolve_mesh_pick(
+                        tool,
+                        {"mesh_pick": "auto"},
+                    ) == "tileset"
+                    cleared = False
+                    if want_tileset and is_lod_folder:
+                        state["values"][tool]["INPUT_MESH"] = None
+                        cleared = True
+                    elif (not want_tileset) and (not is_lod_folder):
+                        state["values"][tool]["INPUT_MESH"] = None
+                        cleared = True
+                    if cleared:
+                        render_body.refresh()
 
             num.on_value_change(on_num)
             _set_as_default_button(tool_id, param)
@@ -1629,12 +1978,62 @@ def render_configure_page() -> None:
                 ui.label(tool["algorithm"]).classes("qt-tool-id")
             if tool.get("description"):
                 ui.label(tool["description"]).classes("qt-lede q-mb-md")
-            for param in tool.get("params", []):
+            if tool.get("id") == "assign_roof_type":
+                with ui.row().classes("w-full items-center gap-2 q-mb-md"):
+
+                    def open_zones() -> None:
+                        mid = state.get("map") or ""
+                        ui.run_javascript(
+                            "window.open('/zones?map=' + encodeURIComponent("
+                            f"{json.dumps(mid)}"
+                            "), '_blank')"
+                        )
+
+                    ui.button(
+                        "Mark zones",
+                        icon="architecture",
+                        on_click=open_zones,
+                    ).props("unelevated no-caps color=teal-8").classes(
+                        "qt-btn"
+                    ).tooltip(
+                        "Open map editor to draw roof_type zone polygons"
+                    )
+                    ui.label(
+                        "Draw zone polygons on imagery/footprints, save to "
+                        "buildings/zones, then pick them below."
+                    ).classes("qt-hint")
+            params = list(tool.get("params") or [])
+            i = 0
+            while i < len(params):
+                param = params[i]
+                gate = param.get("enabled_by")
+                if gate and _param_enabled(tool["id"], param):
+                    group: List[Dict[str, Any]] = []
+                    j = i
+                    while j < len(params) and params[j].get("enabled_by") == gate:
+                        if _param_enabled(tool["id"], params[j]):
+                            group.append(params[j])
+                        j += 1
+                    with ui.element("div").classes("qt-param-group w-full"):
+                        for gi, gp in enumerate(group):
+                            is_last = gi == len(group) - 1
+                            row_cls = "qt-param-subrow w-full items-start no-wrap"
+                            if is_last:
+                                row_cls += " is-last"
+                            with ui.element("div").classes(row_cls):
+                                _param_widget(
+                                    tool["id"],
+                                    gp,
+                                    wired_from=tool_wires.get(gp["id"]),
+                                )
+                    i = j
+                    continue
                 _param_widget(
                     tool["id"],
                     param,
                     wired_from=tool_wires.get(param["id"]),
                 )
+                i += 1
 
     with ui.row().classes("w-full justify-between qt-footer-actions"):
         def back() -> None:
@@ -1650,25 +2049,43 @@ def render_configure_page() -> None:
             except ValueError as exc:
                 ui.notify(str(exc), type="warning")
                 return
-            state["page"] = "run"
-            state["log_lines"] = []
-            state["run_progress"] = {
-                "overall_pct": 0.0,
-                "job_pct": 0.0,
-                "job_index": 0,
-                "job_count": 0,
-                "job_label": "Starting…",
-                "stage": "Opening run console…",
-                "running": True,
-                "done": False,
-                "ok": None,
-                "sub_cur": None,
-                "sub_total": None,
-                "sub_unit": "",
-                "sub_detail": "",
-                "_started": False,
-            }
-            render_body.refresh()
+
+            warnings = _field_replace_warnings()
+            if not warnings:
+                _enter_run_page()
+                return
+
+            with ui.dialog().props("persistent") as dlg, ui.card().classes(
+                "qt-panel q-pa-md"
+            ).style("min-width: 28rem; max-width: 40rem"):
+                ui.label("Attributes will be replaced in new outputs").classes(
+                    "text-h6"
+                )
+                ui.label(
+                    "Source files are not modified. Each tool writes a new file; "
+                    "if the input already has these attributes, their values are "
+                    "recalculated in that copy."
+                ).classes("qt-hint q-mb-md")
+                for w in warnings:
+                    fields = ", ".join(w["fields"])
+                    with ui.column().classes("w-full q-mb-sm gap-0"):
+                        ui.label(
+                            f"{w['tool_name']}: {fields}"
+                        ).classes("text-body2")
+                        ui.label(str(w["input_path"])).classes("qt-meta")
+
+                def confirm() -> None:
+                    dlg.close()
+                    _enter_run_page()
+
+                with ui.row().classes("w-full justify-end gap-2 q-mt-md"):
+                    ui.button("Cancel", on_click=dlg.close).classes(
+                        "qt-btn-ghost"
+                    ).props("flat no-caps")
+                    ui.button(
+                        "Continue", icon="play_arrow", on_click=confirm
+                    ).classes("qt-btn-primary").props("unelevated no-caps")
+            dlg.open()
 
         ui.button("Back", icon="arrow_back", on_click=back).classes(
             "qt-btn-ghost"
@@ -1686,7 +2103,29 @@ _progress_job_lbl = None
 _progress_stage_lbl = None
 _progress_pct_lbl = None
 _progress_sub_lbl = None
+_stop_btn = None
 _log_cursor = 0
+
+
+def _request_stop_queue() -> None:
+    """Signal the worker to kill the current qgis_process tree and halt."""
+    rp = state.get("run_progress") or {}
+    if not rp.get("running") or rp.get("done"):
+        return
+    if rp.get("cancel_requested"):
+        ui.notify("Already stopping…", type="warning")
+        return
+    cancel = state.get("run_cancel")
+    if isinstance(cancel, threading.Event):
+        cancel.set()
+    _append_log(">>> Stop requested — terminating QGIS process tree…")
+    _set_run_progress(
+        {
+            "stage": "Stopping…",
+            "cancel_requested": True,
+        }
+    )
+    ui.notify("Stopping queue…", type="warning")
 
 
 def _append_log(line: str) -> None:
@@ -1784,10 +2223,20 @@ def _sync_run_ui() -> None:
     if rp.get("done") and rp.get("running"):
         # Final notify once
         rp["running"] = False
-        if rp.get("ok"):
+        if rp.get("canceled"):
+            ui.notify("Queue stopped", type="warning")
+        elif rp.get("ok"):
             ui.notify("Queue complete", type="positive")
         elif rp.get("ok") is False:
             ui.notify("Failed — see console", type="negative")
+
+    if _stop_btn is not None:
+        active = bool(rp.get("running") and not rp.get("done"))
+        _stop_btn.set_visibility(active)
+        if rp.get("cancel_requested"):
+            _stop_btn.props("disable")
+        else:
+            _stop_btn.props(remove="disable")
 
 
 def _start_run() -> None:
@@ -1803,11 +2252,19 @@ def _start_run() -> None:
                 {
                     "job_label": "Queue",
                     "stage": "Finding qgis_process…",
+                    "overall_pct": 1.0,
+                    "job_pct": 1.0,
                 }
             )
             bat = find_qgis_process(_qgis_config())
             state["qgis_bat"] = str(bat)
-            _set_run_progress({"stage": "Building job list…"})
+            _set_run_progress(
+                {
+                    "stage": "Building job list…",
+                    "overall_pct": 2.0,
+                    "job_pct": 2.0,
+                }
+            )
             jobs = _build_jobs()
             if not jobs:
                 _append_log("No jobs to run.")
@@ -1836,7 +2293,8 @@ def _start_run() -> None:
                     "stage": (
                         "Launching QGIS (first start can take a while)…"
                     ),
-                    "overall_pct": 0.0,
+                    "overall_pct": 3.0,
+                    "job_pct": 3.0,
                 }
             )
 
@@ -1846,9 +2304,23 @@ def _start_run() -> None:
             def on_progress(info: Dict[str, object]) -> None:
                 _set_run_progress(dict(info))
 
-            results = run_queue(jobs, bat=bat, log=log, progress=on_progress)
-            ok = bool(results) and all(r.ok for r in results)
-            if ok:
+            results = run_queue(
+                jobs,
+                bat=bat,
+                log=log,
+                progress=on_progress,
+                cancel=state.get("run_cancel"),
+            )
+            canceled = bool(
+                (isinstance(state.get("run_cancel"), threading.Event)
+                 and state["run_cancel"].is_set())
+                or any(getattr(r, "canceled", False) for r in results)
+            )
+            ok = (not canceled) and bool(results) and all(r.ok for r in results)
+            if canceled:
+                _append_log("---")
+                _append_log("status  STOPPED — queue canceled")
+            elif ok:
                 _append_log("---")
                 _append_log("status  OK — all jobs finished")
             else:
@@ -1858,12 +2330,17 @@ def _start_run() -> None:
                 {
                     "done": True,
                     "ok": ok,
+                    "canceled": canceled,
                     "overall_pct": 100.0
                     if ok
                     else float(
                         (state.get("run_progress") or {}).get("overall_pct") or 0
                     ),
-                    "stage": "Complete" if ok else "Failed",
+                    "stage": (
+                        "Stopped"
+                        if canceled
+                        else ("Complete" if ok else "Failed")
+                    ),
                     "running": True,
                 }
             )
@@ -1890,7 +2367,7 @@ def _start_run() -> None:
 def render_run_page() -> None:
     global log_box, _progress_bar, _progress_sub_bar, _progress_sub_row
     global _progress_job_lbl, _progress_stage_lbl, _progress_pct_lbl, _progress_sub_lbl
-    global _log_cursor
+    global _stop_btn, _log_cursor
 
     _log_cursor = 0
     ui.label("Running tools via headless QGIS…").classes("qt-lede q-mb-sm")
@@ -1900,7 +2377,13 @@ def render_run_page() -> None:
             _progress_job_lbl = ui.label(
                 str((state.get("run_progress") or {}).get("job_label") or "Starting…")
             ).classes("text-body1")
-            _progress_pct_lbl = ui.label("0%").classes("qt-meta")
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                _progress_pct_lbl = ui.label("0%").classes("qt-meta")
+                _stop_btn = (
+                    ui.button("Stop", icon="stop", on_click=_request_stop_queue)
+                    .classes("qt-btn-ghost")
+                    .props("flat no-caps color=negative dense")
+                )
         _progress_bar = (
             ui.linear_progress(value=0.0, show_value=False)
             .props("color=teal-4 track-color=grey-9 rounded")
@@ -1925,7 +2408,8 @@ def render_run_page() -> None:
 
     ui.timer(0.25, _sync_run_ui)
 
-    # Start the worker from the run page itself (survives body refresh).
+    # Worker is started from _enter_run_page; keep this only as a fallback if
+    # someone lands on the run page without going through that helper.
     rp = state.get("run_progress") or {}
     if rp.get("running") and not rp.get("_started") and not rp.get("done"):
         rp["_started"] = True
@@ -1978,6 +2462,94 @@ def render_body() -> None:
         render_run_page()
 
 
+@ui.page("/zones")
+def zones_page(map: Optional[str] = None) -> None:
+    """Interactive roof-type zone editor (MapLibre + streamed imagery tiles)."""
+    # New tab may land here before shared state is obvious; honor ?map=.
+    if map and not state.get("map"):
+        state["map"] = map
+    ui.dark_mode(True)
+    ui.add_head_html(
+        '<link rel="stylesheet" href="/static/zone_editor.css?v=14">'
+        '<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" '
+        'rel="stylesheet" />'
+        '<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>'
+        '<script src="/static/zone_editor.js?v=14"></script>'
+        '<meta name="theme-color" content="#070b12">'
+        "<style>html,body,#app{margin:0;height:100%;background:#070b12;overflow:hidden}</style>"
+    )
+    if not state.get("map"):
+        with ui.column().classes("q-pa-lg"):
+            ui.label("Choose a map on the main Configure page first.").classes(
+                "text-h6"
+            )
+            ui.button(
+                "Back to tools",
+                on_click=lambda: ui.navigate.to("/"),
+            ).props("flat no-caps color=teal-4")
+        return
+
+    # Raw HTML shell — MapLibre owns the map div.
+    ui.html(
+        f"""
+<div class="ze-shell">
+  <aside class="ze-side">
+    <div class="ze-head">
+      <a class="ze-back" href="/">← QGIS Tools</a>
+      <h1>Mark roof zones</h1>
+    </div>
+
+    <h2 class="ze-h2-tight">Layers</h2>
+    <label>Buildings footprints
+      <select id="ze-buildings"></select>
+    </label>
+    <label>Existing zones (optional)
+      <select id="ze-zones"></select>
+    </label>
+    <label>Imagery GeoTIFF / folder
+      <select id="ze-imagery"></select>
+    </label>
+
+    <h2>Draw</h2>
+    <label>roof_type for next polygon
+      <input id="ze-roof-type" type="number" value="1" step="1" />
+    </label>
+    <div class="ze-row">
+      <button type="button" id="ze-finish" class="ze-primary">Finish polygon</button>
+      <button type="button" id="ze-cancel">Clear draft</button>
+      <button type="button" id="ze-remove-selected">Remove selected</button>
+      <button type="button" id="ze-clear-zones">Clear all zones</button>
+    </div>
+
+    <h2>Legend</h2>
+    <div id="ze-legend" class="ze-legend ze-legend-empty"></div>
+
+    <h2>Zones (<span id="ze-zone-count">0</span>)</h2>
+    <div id="ze-zone-list" class="ze-zone-list"></div>
+
+    <h2>Save</h2>
+    <label>Name
+      <input id="ze-save-name" type="text" value="roof_zones" />
+    </label>
+    <label>Tier
+      <select id="ze-save-tier">
+        <option value="staging">staging</option>
+        <option value="final" selected>final</option>
+        <option value="tests">tests</option>
+      </select>
+    </label>
+    <button type="button" id="ze-save" class="ze-primary">Save zones shapefile</button>
+    <div id="ze-saved-path"></div>
+    <div id="ze-status" class="ze-status"></div>
+  </aside>
+  <div id="ze-map" class="ze-map"></div>
+</div>
+""",
+        sanitize=False,
+    )
+    ui.timer(0.15, lambda: ui.run_javascript("window.qtZoneEditor && window.qtZoneEditor.init()"), once=True)
+
+
 @ui.page("/")
 def index() -> None:
     ui.dark_mode(True)
@@ -1991,7 +2563,7 @@ def index() -> None:
         info="#38bdf8",
         warning="#fbbf24",
     )
-    ui.add_head_html('<link rel="stylesheet" href="/static/theme.css?v=pipe-dag-1">')
+    ui.add_head_html('<link rel="stylesheet" href="/static/theme.css?v=select-instant-2">')
     ui.add_head_html('<script src="/static/flow_connect.js?v=6"></script>')
     ui.add_head_html(
         '<meta name="theme-color" content="#070b12">'

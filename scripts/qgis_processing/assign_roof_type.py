@@ -124,12 +124,6 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.tr("Invalid buildings layer."))
         if zones is None:
             raise QgsProcessingException(self.tr("Invalid zones layer."))
-        if buildings.fields().indexOf(ROOF_TYPE_FIELD) >= 0:
-            raise QgsProcessingException(
-                self.tr(
-                    f"Buildings layer already has '{ROOF_TYPE_FIELD}'."
-                )
-            )
         zone_field = zones.fields().indexOf(ROOF_TYPE_FIELD)
         if zone_field < 0:
             raise QgsProcessingException(
@@ -183,7 +177,19 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
                 self.tr("No usable zones with a valid roof_type.")
             )
 
-        fields = QgsFields(buildings.fields())
+        src_fields = buildings.fields()
+        keep_indices = []
+        fields = QgsFields()
+        for i in range(src_fields.count()):
+            name = src_fields.at(i).name()
+            if name == ROOF_TYPE_FIELD:
+                continue
+            fields.append(src_fields.at(i))
+            keep_indices.append(i)
+        if src_fields.indexOf(ROOF_TYPE_FIELD) >= 0:
+            feedback.pushInfo(
+                self.tr(f"Overwriting existing field '{ROOF_TYPE_FIELD}'.")
+            )
         fields.append(QgsField(ROOF_TYPE_FIELD, QVariant.Int))
 
         out_crs = epsg_4326()
@@ -228,7 +234,7 @@ class AssignRoofTypeAlgorithm(QgsProcessingAlgorithm):
                     )
 
             value = choose_roof_type(complete, partial, rng)
-            attrs = list(feature.attributes())
+            attrs = [feature.attributes()[i] for i in keep_indices]
             attrs.append(value)
             out_geom = to_wgs84_geometry(feature.geometry(), buildings.sourceCrs())
             if out_geom is None:

@@ -14,7 +14,7 @@ scripts/
   tree_points/           # Tree points: pack, thin, sample RGB
   roof_type/             # Assign roof_type from zone polygons
   layers_alignment/      # Overlap priority: roads → water → buildings → trees
-  dtm_burn/              # Push QM under roads; road-ground clip polygons
+  dtm_burn/              # Lower QM under bumps; road-ground clip polygons
 webapp/                  # Local browser UI over qgis_process
 Database/                # Named input/output folders for the UI
 ```
@@ -238,10 +238,14 @@ Folder: [`scripts/dtm_burn/`](scripts/dtm_burn/)
 | [`road_ground_clip_polygons.py`](scripts/dtm_burn/road_ground_clip_polygons.py) | QGIS Processing algorithm |
 | [`road_bump_core.py`](scripts/dtm_burn/road_bump_core.py) | Ground-vs-road overlap |
 | [`road_clip_simplify_core.py`](scripts/dtm_burn/road_clip_simplify_core.py) | Low-vertex shapes inside the road mask |
+| [`flatten_qm_bumps.py`](scripts/dtm_burn/flatten_qm_bumps.py) | Insert bump vertices and lower the interior |
+| [`qm_bump_flatten_core.py`](scripts/dtm_burn/qm_bump_flatten_core.py) | Constrain bump edges in-plane and lower the interior |
 
 Writes polygons where the quantized-mesh surface is above the 3D road mesh, for clipping ground and imagery in Unreal. The terrain tiles are not modified. Only the highest LOD in the mesh folder is used unless a LOD is set. Detection and simplification are one run. With simplification on and a 2D road mask, each bump becomes a road-aligned rectangle when that rectangle stays inside the mask. When the rectangle would stick out, it is cut to the mask and corners are dropped until the shape still covers the bump and stays on the road. Bumps within the merge distance become one shape when that shape has fewer corners. Turn simplification off to write those exact bumps as the main output. Turn on “Also save exact bump polygons” to write a second shapefile of the bumps before simplification. Output is EPSG:4326 with `area_m2`.
 
-Copy `road_ground_clip_polygons.py`, `road_bump_core.py`, `road_clip_simplify_core.py`, `qm_burn_core.py`, and `quantized_mesh.py` into the QGIS scripts folder (or copy the whole `scripts/qgis_processing/` folder after sync).
+**Lower QM ground under bumps** takes the bump polygons and a QM tileset, and rewrites the highest LOD. Each bump outline is cut into the mesh. An original edge that crosses the outline stops there. The mesh outside the outline keeps its height. Inside, each convex piece gets one new vertex at the lowest outline height, fanned out to the outline. Lower LODs are copied through unchanged.
+
+Copy the `scripts/qgis_processing/` folder into the QGIS scripts folder after `python scripts/sync_qgis_processing.py`.
 
 ## Browser UI (local)
 

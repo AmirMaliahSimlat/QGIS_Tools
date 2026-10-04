@@ -3,10 +3,11 @@
 QGIS Processing algorithm: sample min/max terrain altitude from quantized-mesh
 exterior-ring vertices, then add a random height attribute.
 
-Hardcoded fields:
-  altitude      = min mesh elevation
-  max_altitude  = max mesh elevation
-  height        = Uniform(min, max) + (max_altitude - altitude)
+Hardcoded output fields:
+  altitude  = min mesh elevation
+  height    = Uniform(min, max) + (max_mesh - min_mesh)
+
+Max mesh elevation is computed only to form height; it is not written out.
 """
 
 import math
@@ -48,8 +49,11 @@ from crs_util import epsg_4326, to_wgs84_geometry  # noqa: E402
 from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
 
 ALTITUDE_FIELD = "altitude"
-MAX_ALTITUDE_FIELD = "max_altitude"
 HEIGHT_FIELD = "height"
+# Legacy names dropped from inputs (no longer written; shapefile truncates to 10).
+_DROP_FIELD_NAMES = frozenset(
+    {ALTITUDE_FIELD, HEIGHT_FIELD, "max_altitude", "max_altitu"}
+)
 
 
 class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
@@ -81,17 +85,15 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Copies a buildings polygon layer and adds three Double attributes:\n"
+            "Copies a buildings polygon layer and adds two Double attributes:\n"
             f"  {ALTITUDE_FIELD} — minimum terrain altitude on exterior-ring "
             "vertices and edge midpoints\n"
-            f"  {MAX_ALTITUDE_FIELD} — maximum terrain altitude on the same "
-            "sample points\n"
-            f"  {HEIGHT_FIELD} — Uniform(min, max) + "
-            f"({MAX_ALTITUDE_FIELD} - {ALTITUDE_FIELD})\n"
+            f"  {HEIGHT_FIELD} — Uniform(min, max) + (max_mesh - min_mesh), "
+            "where max_mesh is sampled the same way but not written as a field\n"
             "Terrain comes from a Cesium quantized-mesh tileset "
             "({x}/{y}.terrain, gzip, EPSG:4326; finest LOD in the folder). "
             "Holes are ignored. Features with no valid mesh samples get NULL "
-            "for all three fields. Attribute names are fixed."
+            "for both fields. Attribute names are fixed."
         )
 
     def initAlgorithm(self, config=None):
@@ -170,13 +172,29 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
         if min_v > max_v:
             raise QgsProcessingException(self.tr("Minimum must be <= maximum."))
 
-        for name in (ALTITUDE_FIELD, MAX_ALTITUDE_FIELD, HEIGHT_FIELD):
-            if buildings.fields().indexOf(name) >= 0:
-                raise QgsProcessingException(
-                    self.tr(
-                        f"Field '{name}' already exists on the buildings layer."
-                    )
+        target_names = _DROP_FIELD_NAMES
+        src_fields = buildings.fields()
+        keep_indices = []
+        fields = QgsFields()
+        for i in range(src_fields.count()):
+            name = src_fields.at(i).name()
+            if name in target_names:
+                continue
+            fields.append(src_fields.at(i))
+            keep_indices.append(i)
+        overwritten = [
+            n
+            for n in (ALTITUDE_FIELD, HEIGHT_FIELD)
+            if src_fields.indexOf(n) >= 0
+        ]
+        if overwritten:
+            feedback.pushInfo(
+                self.tr(
+                    "Overwriting existing field(s): " + ", ".join(overwritten)
                 )
+            )
+        fields.append(QgsField(ALTITUDE_FIELD, QVariant.Double))
+        fields.append(QgsField(HEIGHT_FIELD, QVariant.Double))
 
         try:
             sampler = QuantizedMeshSampler(mesh_folder)
@@ -203,11 +221,6 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
                 wgs84,
                 QgsProject.instance(),
             )
-
-        fields = QgsFields(buildings.fields())
-        fields.append(QgsField(ALTITUDE_FIELD, QVariant.Double))
-        fields.append(QgsField(MAX_ALTITUDE_FIELD, QVariant.Double))
-        fields.append(QgsField(HEIGHT_FIELD, QVariant.Double))
 
         out_crs = epsg_4326()
         sink_params, atomic = begin_atomic_file_output(parameters, self.OUTPUT)
@@ -271,7 +284,7 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
 
             out_feature = QgsFeature(fields)
             out_feature.setGeometry(out_geom)
-            attrs = list(feature.attributes())
+            attrs = [feature.attributes()[i] for i in keep_indices]
 
             min_z = None
             max_z = None
@@ -296,10 +309,10 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
                 and math.isfinite(max_z)
             ):
                 height = random.uniform(min_v, max_v) + (max_z - min_z)
-                attrs.extend([min_z, max_z, height])
+                attrs.extend([min_z, height])
                 filled += 1
             else:
-                attrs.extend([None, None, None])
+                attrs.extend([None, None])
                 nulls += 1
 
             out_feature.setAttributes(attrs)
@@ -315,7 +328,7 @@ class BuildingAltitudeAndHeightAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.tr("Canceled."))
         feedback.pushInfo(
             self.tr(
-                f"Wrote {ALTITUDE_FIELD}, {MAX_ALTITUDE_FIELD}, {HEIGHT_FIELD} "
+                f"Wrote {ALTITUDE_FIELD}, {HEIGHT_FIELD} "
                 f"in EPSG:4326; filled={filled}, null={nulls}"
                 f"{f', skipped CRS={skipped_crs}' if skipped_crs else ''}."
             )

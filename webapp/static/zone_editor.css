@@ -1,0 +1,256 @@
+/* Zone editor — fixed full-viewport side-by-side (ignore NiceGUI page chrome) */
+
+html,
+body,
+#app,
+.q-layout,
+.q-page-container,
+.q-page,
+.nicegui-content {
+  height: 100% !important;
+  min-height: 100% !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+}
+
+.nicegui-content > div {
+  padding: 0 !important;
+  margin: 0 !important;
+  max-width: none !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.ze-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) 1fr;
+  width: 100vw;
+  height: 100vh;
+  background: #070b12;
+  color: #e8eef7;
+  font-family: "Sora", ui-sans-serif, system-ui, sans-serif;
+}
+
+.ze-side {
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+  padding: 0.4rem 0.85rem 0.65rem;
+  border-right: 1px solid rgba(94, 234, 212, 0.14);
+  overflow: auto;
+  background: #0c121c;
+  min-height: 0;
+}
+
+.ze-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  margin: 0;
+  padding: 0;
+}
+
+.ze-side h1 {
+  font-size: 1.05rem;
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.ze-side h2 {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #f8fafc;
+  margin: 0.7rem 0 0;
+  line-height: 1.2;
+}
+
+.ze-side h2.ze-h2-tight {
+  margin-top: 0.15rem;
+}
+
+.ze-back {
+  text-decoration: none;
+  color: #5eead4;
+  font-size: 0.8rem;
+  line-height: 1.2;
+}
+
+.ze-side label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.78rem;
+  color: #8b9bb0;
+}
+
+.ze-side select,
+.ze-side input {
+  background: #121a27;
+  border: 1px solid rgba(94, 234, 212, 0.2);
+  color: #e8eef7;
+  border-radius: 6px;
+  padding: 0.32rem 0.45rem;
+  font-size: 0.82rem;
+}
+
+.ze-row {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.ze-side button {
+  background: rgba(45, 212, 191, 0.15);
+  border: 1px solid rgba(45, 212, 191, 0.35);
+  color: #5eead4;
+  border-radius: 6px;
+  padding: 0.32rem 0.55rem;
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.ze-side button:hover {
+  background: rgba(45, 212, 191, 0.28);
+}
+
+.ze-side button.ze-primary {
+  background: #2dd4bf;
+  color: #042f2e;
+  border-color: #2dd4bf;
+  font-weight: 600;
+}
+
+.ze-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 7.5rem;
+  overflow: auto;
+}
+
+.ze-legend.ze-legend-empty {
+  max-height: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+.ze-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: #e8eef7;
+  line-height: 1.2;
+}
+
+.ze-legend-label {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.8rem;
+}
+
+.ze-hint {
+  font-size: 0.75rem;
+  color: #8b9bb0;
+  line-height: 1.35;
+}
+
+.ze-status {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.72rem;
+  color: #94a3b8;
+  min-height: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.ze-zone-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 160px;
+  overflow: auto;
+  flex: 0 1 auto;
+  min-height: 0;
+}
+
+.ze-zone-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  background: #121a27;
+  border-radius: 6px;
+  padding: 0.3rem 0.45rem;
+}
+
+.ze-zone-row-selected {
+  outline: 1px solid rgba(244, 114, 182, 0.7);
+  background: #1a1520;
+}
+
+.ze-zone-pick {
+  flex: 1 1 auto;
+  text-align: left !important;
+  background: transparent !important;
+  border: none !important;
+  color: #e8eef7 !important;
+  padding: 0.15rem 0.2rem !important;
+  cursor: pointer;
+  font-size: 0.8rem !important;
+}
+
+.ze-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+
+.ze-del {
+  margin-left: auto !important;
+  padding: 0.2rem 0.5rem !important;
+  font-size: 0.72rem !important;
+  color: #fda4af !important;
+  border-color: rgba(251, 113, 133, 0.45) !important;
+  background: rgba(251, 113, 133, 0.12) !important;
+  flex: 0 0 auto;
+}
+
+.ze-map {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.ze-map .maplibregl-map,
+.ze-map .maplibregl-canvas-container,
+.ze-map .maplibregl-canvas,
+.ze-map canvas {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23ef4444' stroke-width='2.2' stroke-linecap='round'/%3E%3Ccircle cx='12' cy='12' r='2.2' fill='%23ef4444'/%3E%3C/svg%3E")
+      12 12,
+    crosshair !important;
+}
+
+.ze-map .maplibregl-map {
+  position: absolute;
+  inset: 0;
+}
+
+#ze-saved-path {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.7rem;
+  color: #34d399;
+  word-break: break-all;
+}

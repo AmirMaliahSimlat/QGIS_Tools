@@ -305,6 +305,12 @@ def _vector_destination_exists(final: Path) -> bool:
     return final.exists()
 
 
+def destination_file_path(value: Any) -> Optional[str]:
+    """Public helper: unwrap a Processing OUTPUT value to a filesystem path string."""
+    path = _as_path(value)
+    return str(path) if path is not None else None
+
+
 def begin_atomic_file_output(
     parameters: Parameters,
     key: str = "OUTPUT",
@@ -490,15 +496,19 @@ def finish_or_abandon(
     sink: Any = None,
     context: Any = None,
     dest_id: Any = None,
+    flush_shapefile: bool = False,
 ) -> Optional[str]:
     """
     Close sink, then finalize or abandon.
 
     Returns the final path string when ok and an atomic handle was used.
     When ``handle`` is None (temporary output / shapefile), the Processing
-    ``dest_id`` layer is left alone so QGIS can add it to the project.
-    Pass ``context`` + ``dest_id`` only for atomic GeoPackage renames that
-    need the file unlocked on Windows.
+    ``dest_id`` layer is left alone so QGIS can add it to the project —
+    unless ``flush_shapefile`` is True, which releases the dest layer so OGR
+    flushes SHP/DBF/SHX headers (required when writing many shapefiles in one
+    run; otherwise a kill or open-handle leak leaves record-count = 0).
+    Pass ``context`` + ``dest_id`` for atomic GeoPackage renames that need the
+    file unlocked on Windows.
     """
     import gc
 
@@ -511,8 +521,9 @@ def finish_or_abandon(
         sink = None
 
     if handle is None:
-        # Temporary layer or direct file write — keep dest_id registered for
-        # layersToLoadOnCompletion / temporaryLayerStore.
+        if flush_shapefile and context is not None and dest_id is not None:
+            # Shapefile is already at its final path; unlock so headers flush.
+            _release_dest_layer(context, dest_id)
         gc.collect()
         return None
 

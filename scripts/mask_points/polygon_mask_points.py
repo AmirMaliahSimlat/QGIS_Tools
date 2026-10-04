@@ -46,8 +46,15 @@ for _p in (_SCRIPT_DIR, _SCRIPTS_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from outline_qm_crossings import (  # noqa: E402
+    EdgeIndex,
+    densify_ring,
+    mask_vertex_points,
+)
 from quantized_mesh import (  # noqa: E402
     QuantizedMeshSampler,
+    load_tile,
+    lonlat_to_tile,
     sample_lonlats_parallel,
 )
 from atomic_io import begin_atomic_file_output, finish_or_abandon  # noqa: E402
@@ -65,6 +72,9 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_POLYGONS = "INPUT_POLYGONS"
     INPUT_MESH = "INPUT_MESH"
     SPACING = "SPACING"
+    USE_MASK_VERTICES = "USE_MASK_VERTICES"
+    MIN_SEPARATION_MM = "MIN_SEPARATION_MM"
+    ADD_QM_CROSSINGS = "ADD_QM_CROSSINGS"
     ADD_CENTER_POINTS = "ADD_CENTER_POINTS"
     CENTER_MODE = "CENTER_MODE"
     CENTER_GRID_SPACING = "CENTER_GRID_SPACING"
@@ -91,15 +101,26 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Samples points along every polygon outline — exterior rings "
-            "and inner holes — at a chosen spacing in meters, and assigns "
-            "terrain altitude from a Cesium quantized-mesh tileset.\n\n"
+            "Places points every N meters along every polygon outline — "
+            "exterior rings and inner holes — and assigns terrain altitude "
+            "from a Cesium quantized-mesh tileset. Mask vertices between "
+            "those samples are not copied.\n\n"
+            "Optional: use only the vertices already stored on the mask. "
+            "That skips spacing samples. Mesh-edge crossings can still be "
+            "added on those vertices.\n\n"
+            "Minimum separation, in millimetres: when two consecutive "
+            "outline points are closer than that, the later one is removed. "
+            "0 keeps every point. The same gap applies to mask vertices, "
+            "spacing samples, and mesh-edge crossings.\n\n"
             "Use for road masks or water footprints when the shore/curb "
             "should follow mesh height (not a single flat altitude).\n\n"
             f"Output is PointZ with '{ALTITUDE_FIELD}' and '{ROLE_FIELD}' "
             f"('{ROLE_OUTLINE}' or '{ROLE_CENTER}').\n\n"
             "Optional (legacy): Add center points inside each mask — sparse "
             "grid or chord midpoints.\n\n"
+            "By default, also adds a point wherever a quantized-mesh edge "
+            "crosses the outline, so a mesh edge cannot pass between two "
+            "outline samples without a vertex on that crossing.\n\n"
             "Expects {x}/{y}.terrain tiles (gzip), EPSG:4326 / TMS; "
             "finest LOD in the folder is used."
         )
@@ -120,12 +141,35 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.USE_MASK_VERTICES,
+                self.tr("Use only mask vertices"),
+                defaultValue=False,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterNumber(
                 self.SPACING,
                 self.tr("Outline point spacing (meters)"),
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=5.0,
                 minValue=0.01,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.MIN_SEPARATION_MM,
+                self.tr("Remove a point closer than (mm)"),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.0,
+                minValue=0.0,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.ADD_QM_CROSSINGS,
+                self.tr("Add a point where a QM edge crosses the outline"),
+                defaultValue=True,
             )
         )
         self.addParameter(
@@ -179,6 +223,15 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         )
         mesh_folder = self.parameterAsFile(parameters, self.INPUT_MESH, context)
         spacing = self.parameterAsDouble(parameters, self.SPACING, context)
+        use_mask_vertices = self.parameterAsBool(
+            parameters, self.USE_MASK_VERTICES, context
+        )
+        min_separation_mm = self.parameterAsDouble(
+            parameters, self.MIN_SEPARATION_MM, context
+        )
+        add_qm_crossings = self.parameterAsBool(
+            parameters, self.ADD_QM_CROSSINGS, context
+        )
         add_center_points = self.parameterAsBool(
             parameters, self.ADD_CENTER_POINTS, context
         )
@@ -196,10 +249,15 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 self.tr("Invalid quantized-mesh tiles folder.")
             )
-        if spacing <= 0:
+        if not use_mask_vertices and spacing <= 0:
             raise QgsProcessingException(
                 self.tr("Outline spacing must be > 0.")
             )
+        if min_separation_mm < 0:
+            raise QgsProcessingException(
+                self.tr("Minimum separation must be >= 0 mm.")
+            )
+        min_sep_m = min_separation_mm / 1000.0
         if center_grid_spacing <= 0:
             raise QgsProcessingException(
                 self.tr("Center grid spacing must be > 0.")
@@ -236,6 +294,17 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 )
         else:
             feedback.pushInfo(self.tr("Outline points only (centers OFF)."))
+        if use_mask_vertices:
+            feedback.pushInfo(
+                self.tr("Using mask vertices (no spacing samples).")
+            )
+        if min_separation_mm > 0:
+            feedback.pushInfo(
+                self.tr(
+                    "Dropping an outline point closer than "
+                    f"{min_separation_mm:g} mm to the previous one."
+                )
+            )
 
         source_crs = layer.sourceCrs()
         metric_crs = self._metric_crs_for_layer(layer, feedback)
@@ -249,6 +318,31 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         to_wgs84 = QgsCoordinateTransform(
             source_crs, wgs84, QgsProject.instance()
         )
+        wgs_to_metric = QgsCoordinateTransform(
+            wgs84, metric_crs, QgsProject.instance()
+        )
+
+        qm_index = None
+        if add_qm_crossings:
+            feedback.setProgressText(
+                self.tr("Collecting quantized-mesh edges…")
+            )
+            qm_edges = self._qm_edges_in_metric(
+                sampler, layer, to_wgs84, wgs_to_metric, feedback
+            )
+            if qm_edges:
+                qm_index = EdgeIndex(qm_edges, cell_m=80.0)
+                feedback.pushInfo(
+                    self.tr(
+                        f"QM edge crossings ON — {len(qm_edges)} mesh edges."
+                    )
+                )
+            else:
+                feedback.pushWarning(
+                    self.tr("No QM edges in the mask extent; crossings skipped.")
+                )
+        else:
+            feedback.pushInfo(self.tr("QM edge crossings OFF."))
 
         fields = QgsFields()
         fields.append(QgsField(ALTITUDE_FIELD, QVariant.Double))
@@ -277,6 +371,14 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         null_alt = 0
         canceled = False
         progress = _Progress(feedback, n_poly, self.tr)
+        total_edges = 0
+        for feature in features:
+            geom = feature.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            for ring in self._all_rings(geom):
+                total_edges += _outline_edge_count(ring)
+        queue = _PointQueueProgress(feedback, total_edges, self.tr)
 
         # Collect (src_x, src_y, lon, lat, role) then mesh-sample in parallel.
         pending = []
@@ -288,23 +390,87 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
             progress.begin_polygon(i, feature.id())
             geom = feature.geometry()
             if geom is None or geom.isEmpty():
-                progress.finish_polygon(
-                    written_outline, written_center, "empty"
-                )
+                progress.set_text("empty")
                 continue
 
             rings = [r for r in self._all_rings(geom) if r and len(r) >= 2]
             n_rings = max(len(rings), 1)
+            edges_done = queue.pos
             for r_idx, ring in enumerate(rings):
                 if feedback.isCanceled():
                     canceled = True
                     break
+                n_edges = _outline_edge_count(ring)
+                if use_mask_vertices and qm_index is None:
+                    verts = _ring_vertices(ring)
+                    n_pts = len(verts)
+                    for p_idx, (x, y) in enumerate(verts):
+                        if feedback.isCanceled():
+                            canceled = True
+                            break
+                        src_pt = QgsPointXY(x, y)
+                        wgs = to_wgs84.transform(src_pt)
+                        pending.append(
+                            (
+                                src_pt.x(),
+                                src_pt.y(),
+                                wgs.x(),
+                                wgs.y(),
+                                ROLE_OUTLINE,
+                            )
+                        )
+                        if p_idx % 2000 == 0 or p_idx + 1 == n_pts:
+                            progress.set_text(
+                                (
+                                    f"outline ring {r_idx + 1}/{n_rings}, "
+                                    f"vertex {p_idx + 1}/{n_pts} "
+                                    f"(queued={len(pending)})"
+                                )
+                            )
+                            queue.report(edges_done + p_idx + 1)
+                    edges_done += n_pts
+                    continue
+
                 metric_ring = []
                 for pt in ring:
                     mpt = to_metric.transform(QgsPointXY(pt[0], pt[1]))
                     metric_ring.append((mpt.x(), mpt.y()))
 
-                densified = list(self._densify_ring(metric_ring, spacing))
+                def _on_edge(
+                    done,
+                    total,
+                    base=edges_done,
+                    n_edges=n_edges,
+                    r_idx=r_idx,
+                    n_rings=n_rings,
+                ):
+                    progress.set_text(
+                        (
+                            f"outline ring {r_idx + 1}/{n_rings}, "
+                            f"edge {done}/{total}"
+                        )
+                    )
+                    queue.report(base + (done / max(total, 1)) * n_edges * 0.5)
+
+                if use_mask_vertices:
+                    densified = list(
+                        mask_vertex_points(
+                            metric_ring,
+                            edge_index=qm_index,
+                            on_edge=_on_edge,
+                            min_sep_m=min_sep_m,
+                        )
+                    )
+                else:
+                    densified = list(
+                        self._densify_ring(
+                            metric_ring,
+                            spacing,
+                            edge_index=qm_index,
+                            on_edge=_on_edge,
+                            min_sep_m=min_sep_m,
+                        )
+                    )
                 n_pts = max(len(densified), 1)
                 for p_idx, (mx, my) in enumerate(densified):
                     if feedback.isCanceled():
@@ -315,17 +481,19 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                     pending.append(
                         (src_pt.x(), src_pt.y(), wgs.x(), wgs.y(), ROLE_OUTLINE)
                     )
-                    if p_idx % 100 == 0 or p_idx + 1 == n_pts:
-                        ring_frac = (r_idx + (p_idx + 1) / n_pts) / n_rings
-                        outline_frac = 0.5 * ring_frac
-                        progress.update(
-                            outline_frac,
+                    if p_idx % 2000 == 0 or p_idx + 1 == n_pts:
+                        frac = (p_idx + 1) / n_pts
+                        progress.set_text(
                             (
                                 f"outline ring {r_idx + 1}/{n_rings}, "
                                 f"point {p_idx + 1}/{n_pts} "
                                 f"(queued={len(pending)})"
-                            ),
+                            )
                         )
+                        queue.report(
+                            edges_done + n_edges * (0.5 + 0.5 * frac)
+                        )
+                edges_done += n_edges
 
             if add_center_points and not feedback.isCanceled():
                 parts = list(self._metric_polygon_parts(geom, to_metric))
@@ -336,17 +504,12 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                         break
 
                     def _center_progress(done, total, label="centers"):
-                        part_base = part_idx / n_parts
-                        part_span = 1.0 / n_parts
-                        local = (done / max(total, 1)) if total else 1.0
-                        frac = 0.5 + 0.5 * (part_base + part_span * local)
-                        progress.update(
-                            frac,
+                        progress.set_text(
                             (
                                 f"{label} part {part_idx + 1}/{n_parts}, "
                                 f"{done}/{max(total, 1)} "
                                 f"(queued={len(pending)})"
-                            ),
+                            )
                         )
 
                     if center_mode == CENTER_MODE_LEGACY_CHORDS:
@@ -383,7 +546,13 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                             )
                         )
 
-            progress.finish_polygon(written_outline, written_center, "queued")
+            progress.set_text(
+                (
+                    f"queued — totals outline={written_outline}, "
+                    f"center={written_center}"
+                )
+            )
+        queue.report(float(queue.total))
 
         if feedback.isCanceled():
             canceled = True
@@ -440,11 +609,20 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                 mode_note = ", centers=legacy chords"
             else:
                 mode_note = f", centers=grid {center_grid_spacing} m"
+        cross_note = ""
+        if qm_index is not None:
+            cross_note = f", QM edge crossings={qm_index.inserted}"
+        if use_mask_vertices:
+            spacing_note = "mask vertices only"
+        else:
+            spacing_note = f"outline spacing={spacing} m"
+        if min_separation_mm > 0:
+            spacing_note += f", min separation={min_separation_mm:g} mm"
         feedback.pushInfo(
             self.tr(
                 f"Wrote {written_outline} outline + {written_center} center "
-                f"points (altitude null={null_alt}, outline spacing="
-                f"{spacing} m{mode_note})."
+                f"points (altitude null={null_alt}, {spacing_note}"
+                f"{mode_note}{cross_note})."
             )
         )
         return {self.OUTPUT: published or dest_id}
@@ -783,45 +961,106 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
                     yield ring
 
     @staticmethod
-    def _densify_ring(ring, spacing):
+    def _densify_ring(
+        ring, spacing, edge_index=None, on_edge=None, min_sep_m=0.0
+    ):
         """
-        Yield (x, y) along a closed or open ring in meter coordinates.
-        Includes each vertex; inserts intermediate stations every ~spacing.
-        Skips duplicating a closing vertex that matches the first.
+        Yield (x, y) every ``spacing`` meters along a ring, plus QM-edge
+        crossings when ``edge_index`` is set. Mask vertices in between
+        are not copied. ``min_sep_m`` drops a later point closer than that.
         """
-        if not ring or spacing <= 0:
-            return
+        return densify_ring(
+            ring,
+            spacing,
+            edge_index=edge_index,
+            on_edge=on_edge,
+            min_sep_m=min_sep_m,
+        )
 
-        pts = list(ring)
-        if (
-            len(pts) >= 2
-            and abs(pts[0][0] - pts[-1][0]) < 1e-9
-            and abs(pts[0][1] - pts[-1][1]) < 1e-9
-        ):
-            pts = pts[:-1]
-        if len(pts) < 2:
-            if pts:
-                yield pts[0]
-            return
-
-        closed = pts + [pts[0]]
-        yield closed[0]
-        for i in range(len(closed) - 1):
-            x1, y1 = closed[i]
-            x2, y2 = closed[i + 1]
-            dx = x2 - x1
-            dy = y2 - y1
-            length = math.hypot(dx, dy)
-            if length < 1e-9:
+    def _qm_edges_in_metric(
+        self, sampler, layer, to_wgs84, wgs_to_metric, feedback
+    ):
+        """Unique QM triangle edges overlapping the layer, in metric XY."""
+        extent = layer.extent()
+        corners = (
+            QgsPointXY(extent.xMinimum(), extent.yMinimum()),
+            QgsPointXY(extent.xMinimum(), extent.yMaximum()),
+            QgsPointXY(extent.xMaximum(), extent.yMinimum()),
+            QgsPointXY(extent.xMaximum(), extent.yMaximum()),
+        )
+        lons = []
+        lats = []
+        for corner in corners:
+            wgs = to_wgs84.transform(corner)
+            lons.append(wgs.x())
+            lats.append(wgs.y())
+        pad = 0.02
+        west, east = min(lons) - pad, max(lons) + pad
+        south, north = min(lats) - pad, max(lats) + pad
+        level = int(sampler.level)
+        x0, y0 = lonlat_to_tile(level, west, south)
+        x1, y1 = lonlat_to_tile(level, east, north)
+        tiles = [
+            (x, y)
+            for x in range(min(x0, x1), max(x0, x1) + 1)
+            for y in range(min(y0, y1), max(y0, y1) + 1)
+            if (x, y) in sampler.tiles_index
+        ]
+        feedback.pushInfo(
+            self.tr(f"QM tiles overlapping the mask: {len(tiles)}.")
+        )
+        seen = set()
+        raw = []
+        n_tiles = max(len(tiles), 1)
+        for ti, (tx, ty) in enumerate(tiles):
+            if feedback.isCanceled():
+                break
+            if ti % 5 == 0 or ti + 1 == len(tiles):
+                feedback.setProgressText(
+                    self.tr(f"Reading QM edges, tile {ti + 1}/{n_tiles}…")
+                )
+            path = sampler.root / str(tx) / f"{ty}.terrain"
+            try:
+                tile = load_tile(path, level, tx, ty)
+            except Exception as exc:
+                feedback.pushWarning(
+                    self.tr(f"Skipped tile {tx}/{ty}: {exc}")
+                )
                 continue
-            n_extra = int(math.floor(length / spacing))
-            for k in range(1, n_extra + 1):
-                t = (k * spacing) / length
-                if t >= 1.0 - 1e-12:
-                    break
-                yield (x1 + t * dx, y1 + t * dy)
-            if i < len(closed) - 2:
-                yield (x2, y2)
+            lons_v = tile.lons
+            lats_v = tile.lats
+            for i0, i1, i2 in tile.triangles:
+                for a, b in ((i0, i1), (i1, i2), (i2, i0)):
+                    ka = (round(lons_v[a], 6), round(lats_v[a], 6))
+                    kb = (round(lons_v[b], 6), round(lats_v[b], 6))
+                    if ka == kb:
+                        continue
+                    key = (ka, kb) if ka <= kb else (kb, ka)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    raw.append(
+                        (
+                            (float(lons_v[a]), float(lats_v[a])),
+                            (float(lons_v[b]), float(lats_v[b])),
+                        )
+                    )
+        feedback.pushInfo(self.tr(f"Unique QM edges: {len(raw)}."))
+        cache = {}
+
+        def metric_of(lon, lat):
+            key = (round(lon, 7), round(lat, 7))
+            hit = cache.get(key)
+            if hit is None:
+                pt = wgs_to_metric.transform(QgsPointXY(lon, lat))
+                hit = (pt.x(), pt.y())
+                cache[key] = hit
+            return hit
+
+        return [
+            (metric_of(lon1, lat1), metric_of(lon2, lat2))
+            for (lon1, lat1), (lon2, lat2) in raw
+        ]
 
     @staticmethod
     def _metric_crs_for_layer(layer, feedback):
@@ -864,6 +1103,51 @@ class PolygonMaskPointsAlgorithm(QgsProcessingAlgorithm):
         return metric
 
 
+def _ring_vertices(ring):
+    """Mask vertices, without a closing vertex that repeats the first."""
+    verts = [(float(p[0]), float(p[1])) for p in ring]
+    if len(verts) >= 2:
+        x0, y0 = verts[0]
+        x1, y1 = verts[-1]
+        if abs(x0 - x1) < 1e-9 and abs(y0 - y1) < 1e-9:
+            verts = verts[:-1]
+    return verts
+
+
+def _outline_edge_count(ring) -> int:
+    """Edges densify walks: drop a closing duplicate, then close the ring."""
+    return len(_ring_vertices(ring))
+
+
+class _PointQueueProgress:
+    """Bar for the outline pass, scored across every queued point."""
+
+    def __init__(self, feedback, total, tr):
+        self.feedback = feedback
+        self.tr = tr
+        self.total = max(int(total), 1)
+        self.pos = 0.0
+        self._shown = -10_000
+
+    def report(self, pos: float) -> None:
+        pos = max(self.pos, float(pos))
+        self.pos = pos
+        shown = int(pos)
+        if shown - self._shown < 4000 and shown < self.total:
+            return
+        self._shown = shown
+        capped = min(shown, self.total)
+        frac = capped / self.total
+        # 5–80% of the job. Altitude sampling uses the rest.
+        pct = int(5 + 75 * frac)
+        self.feedback.setProgress(min(max(pct, 1), 80))
+        self.feedback.setProgressText(
+            self.tr(
+                f"Queuing outline points: {capped}/{self.total} points"
+            )
+        )
+
+
 class _Progress:
     """Per-polygon progress: bar moves within each feature, text shows phase."""
 
@@ -878,7 +1162,15 @@ class _Progress:
     def begin_polygon(self, index, fid):
         self.index = index
         self.fid = fid
-        self.update(0.0, "starting")
+        self.set_text("starting")
+
+    def set_text(self, detail):
+        self.feedback.setProgressText(
+            self.tr(
+                f"Polygon {self.index + 1}/{self.n_poly} "
+                f"(id={self.fid}): {detail}"
+            )
+        )
 
     def update(self, local_frac, detail):
         local_frac = max(0.0, min(1.0, float(local_frac)))
@@ -887,12 +1179,7 @@ class _Progress:
         if pct != self._last_pct or local_frac in (0.0, 1.0):
             self._last_pct = pct
             self.feedback.setProgress(min(pct, 99))
-        self.feedback.setProgressText(
-            self.tr(
-                f"Polygon {self.index + 1}/{self.n_poly} "
-                f"(id={self.fid}): {detail}"
-            )
-        )
+        self.set_text(detail)
 
     def finish_polygon(self, written_outline, written_center, detail):
         self.update(

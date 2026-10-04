@@ -37,7 +37,13 @@ _WIRE_CHAINS: Tuple[Tuple[Tuple[str, Optional[str]], ...], ...] = (
         ("building_altitude_and_height", "INPUT_BUILDINGS"),
         ("assign_roof_type", "INPUT_BUILDINGS"),
     ),
-    # polygon_mask_points (roads) stays alone — no chain entry.
+    # Outline points stay unwired. Clip feeds simplify, and feeds the QM
+    # lower step only when simplify is not selected (nearest upstream wins).
+    (
+        ("road_ground_clip_polygons", None),
+        ("simplify_bump_polygons", "INPUT_BUMPS"),
+        ("flatten_qm_bumps", "INPUT_BUMPS"),
+    ),
 )
 
 
